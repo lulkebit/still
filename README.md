@@ -2,6 +2,22 @@
 
 `still` is a small local-first macOS notes app for Markdown notes, checklists, standalone tasks, and a personal wiki. Notes and attachments stay on this Mac under `~/Library/Application Support/still`. The `STILL_DATA_DIR` environment variable can point the app at a separate workspace.
 
+## Screenshots
+
+These screenshots use fictional demo content about a small reading salon.
+
+**Notes** — Planning a small reading evening.
+
+![Notes view with a reading-evening note and folder sidebar](docs/screenshots/notes.png)
+
+**Tasks** — A short set of reading-evening preparations.
+
+![Tasks view with standalone reading-evening tasks and note checklists](docs/screenshots/tasks.png)
+
+**Wiki** — A compact guide for planning a reading group.
+
+![Wiki view showing the fictional “Leserunde planen” guide](docs/screenshots/wiki.png)
+
 ## Build
 
 Requires macOS 27 or later, Xcode 27 with Swift 6.4, and Node.js/npm only when the bundled editor needs rebuilding.
