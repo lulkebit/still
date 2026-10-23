@@ -1,0 +1,4 @@
+.build/
+build/
+Editor/node_modules/
+.DS_Store
