@@ -16,6 +16,15 @@ final class StillStore {
 
     let rootURL: URL
     private var canWrite = false
+    private(set) var linkCatalogRevision: UInt64 = 0
+    @ObservationIgnored private var backlinkTargets: [UUID: Set<UUID>] = [:]
+    @ObservationIgnored private let writeQueue = DispatchQueue(label: "still.autosave", qos: .utility)
+    @ObservationIgnored private var autosaveTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingSaveStartedAt: ContinuousClock.Instant?
+    @ObservationIgnored private var dirtyVersions: [UUID: UInt64] = [:]
+    @ObservationIgnored private var editVersion: UInt64 = 0
+    @ObservationIgnored private var saveSequence: UInt64 = 0
+    @ObservationIgnored private var appliedSaveSequence: UInt64 = 0
 
     init(rootURL: URL? = nil, seedIfEmpty: Bool = true) {
         if let rootURL {
@@ -62,9 +71,12 @@ final class StillStore {
     func backlinks(to note: Note) -> [Note] {
         notes.filter { source in
             guard source.id != note.id else { return false }
-            return NoteLinks.links(in: source.markdown).contains { link in
-                resolveWikiLink(link.target, from: source)?.id == note.id
+            if backlinkTargets[source.id] == nil {
+                backlinkTargets[source.id] = Set(NoteLinks.links(in: source.markdown).compactMap {
+                    resolveWikiLink($0.target, from: source)?.id
+                })
             }
+            return backlinkTargets[source.id]?.contains(note.id) == true
         }
     }
 
@@ -97,6 +109,7 @@ final class StillStore {
             throw error
         }
         notes = nextNotes
+        invalidateLinkCatalog()
         errorMessage = nil
         return note
     }
@@ -133,26 +146,89 @@ final class StillStore {
         candidate[index] = next
         notes = candidate
         dirtyNoteIDs.insert(id)
-        do {
-            try writeMarkdown(markdown, for: next)
-            try saveManifest(notes: candidate)
-            dirtyNoteIDs.remove(id)
+        editVersion &+= 1
+        dirtyVersions[id] = editVersion
+        backlinkTargets.removeValue(forKey: id)
+        scheduleAutosave()
+    }
+
+    /// Drains background writes and durably saves the latest editor state before returning.
+    func flushPendingWrites() {
+        do { try flushWrites() }
+        catch { errorMessage = L10n.text("error.save") }
+    }
+
+    private func scheduleAutosave() {
+        let now = ContinuousClock.now
+        let started = pendingSaveStartedAt ?? now
+        pendingSaveStartedAt = started
+        let deadline = min(now.advanced(by: .milliseconds(220)), started.advanced(by: .seconds(1)))
+        autosaveTask?.cancel()
+        autosaveTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(until: deadline, clock: .continuous) }
+            catch { return }
+            self?.enqueueAutosave()
+        }
+    }
+
+    private func enqueueAutosave() {
+        autosaveTask = nil
+        pendingSaveStartedAt = nil
+        guard canWrite, !dirtyNoteIDs.isEmpty else { return }
+        let snapshot = pendingWrite()
+        writeQueue.async { [weak self] in
+            let result = Result { try snapshot.write() }
+            Task { @MainActor [weak self] in self?.completeWrite(snapshot, result: result) }
+        }
+    }
+
+    private func flushWrites() throws {
+        autosaveTask?.cancel()
+        autosaveTask = nil
+        pendingSaveStartedAt = nil
+        guard canWrite else { return }
+        guard !dirtyNoteIDs.isEmpty else {
+            writeQueue.sync {}
+            return
+        }
+        let snapshot = pendingWrite()
+        // The serial queue is also a barrier for rename/move/trash and manifest updates.
+        let result = writeQueue.sync { Result { try snapshot.write() } }
+        completeWrite(snapshot, result: result)
+        try result.get()
+    }
+
+    private func pendingWrite() -> StoreWriteSnapshot {
+        saveSequence &+= 1
+        return StoreWriteSnapshot(
+            sequence: saveSequence,
+            versions: dirtyVersions,
+            rootURL: rootURL,
+            files: notes.filter { dirtyNoteIDs.contains($0.id) }.map {
+                StoreWriteSnapshot.MarkdownFile(url: relativeURL(for: $0), markdown: $0.markdown)
+            },
+            manifest: manifest()
+        )
+    }
+
+    private func completeWrite(_ snapshot: StoreWriteSnapshot, result: Result<Void, Error>) {
+        guard snapshot.sequence > appliedSaveSequence else { return }
+        appliedSaveSequence = snapshot.sequence
+        switch result {
+        case .success:
+            for (id, version) in snapshot.versions where dirtyVersions[id] == version {
+                dirtyVersions.removeValue(forKey: id)
+                dirtyNoteIDs.remove(id)
+            }
             errorMessage = nil
-        } catch {
+        case .failure:
             errorMessage = L10n.text("error.save")
         }
     }
 
-    func flushPendingWrites() {
-        guard canWrite, !dirtyNoteIDs.isEmpty else { return }
-        do {
-            for note in notes where dirtyNoteIDs.contains(note.id) { try writeMarkdown(note.markdown, for: note) }
-            try saveManifest()
-            dirtyNoteIDs.removeAll()
-            errorMessage = nil
-        } catch {
-            errorMessage = L10n.text("error.save")
-        }
+    private func invalidateLinkCatalog() {
+        linkCatalogRevision &+= 1
+        backlinkTargets.removeAll(keepingCapacity: true)
     }
 
     func renameNote(id: UUID, title: String) throws {
@@ -203,6 +279,7 @@ final class StillStore {
         }
         try? removeMarkdown(for: note)
         notes.removeAll { $0.id == id }
+        invalidateLinkCatalog()
         trash = nextTrash
         errorMessage = nil
     }
@@ -305,6 +382,7 @@ final class StillStore {
         }
         for note in descendants { try? removeMarkdown(for: note) }
         notes = nextNotes
+        invalidateLinkCatalog()
         folders = nextFolders
         trash = nextTrash
         errorMessage = nil
@@ -347,6 +425,7 @@ final class StillStore {
             throw error
         }
         notes = tentativeNotes
+        invalidateLinkCatalog()
         errorMessage = nil
         return created
     }
@@ -354,8 +433,11 @@ final class StillStore {
     func setLastOpenedNote(_ id: UUID?) {
         guard canWrite, lastOpenedNoteID != id else { return }
         let previous = lastOpenedNoteID
-        lastOpenedNoteID = id
-        do { try saveManifest() } catch { lastOpenedNoteID = previous; errorMessage = L10n.text("error.save") }
+        do {
+            try flushWrites()
+            lastOpenedNoteID = id
+            try saveManifest()
+        } catch { lastOpenedNoteID = previous; errorMessage = L10n.text("error.save") }
     }
 
     func toggleEmbeddedTask(_ task: EmbeddedTask) {
@@ -369,6 +451,7 @@ final class StillStore {
         updatedLine.replaceSubrange(stateRange, with: mark)
         lines[task.lineIndex] = updatedLine
         updateMarkdown(id: task.noteID, markdown: lines.joined(separator: "\n"))
+        flushPendingWrites()
     }
 
     func completeAllEmbeddedTasks() -> [EmbeddedTask] { embeddedTasks }
@@ -542,7 +625,17 @@ final class StillStore {
         trash trashOverride: [TrashEntry]? = nil
     ) throws {
         try ensureWritableUnlessLoading()
-        let manifest = StoreManifest(
+        let manifest = manifest(notes: noteOverride, folders: folderOverride, trash: trashOverride)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(manifest)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try data.write(to: rootURL.appendingPathComponent("manifest.json"), options: .atomic)
+    }
+
+    private func manifest(notes noteOverride: [Note]? = nil, folders folderOverride: [Folder]? = nil,
+                          trash trashOverride: [TrashEntry]? = nil) -> StoreManifest {
+        StoreManifest(
             formatVersion: 1,
             notes: (noteOverride ?? notes).map(NoteIndexEntry.init(note:)),
             folders: folderOverride ?? folders,
@@ -551,15 +644,11 @@ final class StillStore {
             settings: settings,
             lastOpenedNoteID: lastOpenedNoteID
         )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(manifest)
-        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
-        try data.write(to: rootURL.appendingPathComponent("manifest.json"), options: .atomic)
     }
 
     private func ensureWritable() throws {
         guard canWrite else { throw StoreError.workspaceReadOnly }
+        try flushWrites()
     }
 
     private func hasExistingMarkdownFiles() -> Bool {
@@ -725,6 +814,7 @@ final class StillStore {
             throw error
         }
         notes = nextNotes
+        invalidateLinkCatalog()
         if let folderOverride { folders = folderOverride }
         dirtyNoteIDs.subtract(writtenIDs)
         for old in oldNotes where !updatedNotes.contains(where: { relativeURL(for: $0) == relativeURL(for: old) }) {
@@ -785,5 +875,31 @@ enum StoreError: LocalizedError {
         case .invalidWikiLink: L10n.text("error.invalidWikiLink")
         case .ambiguousWikiLink: L10n.text("error.ambiguousWikiLink")
         }
+    }
+}
+
+/// Immutable snapshots keep encoding and atomic filesystem writes off the main actor.
+private struct StoreWriteSnapshot: Sendable {
+    struct MarkdownFile: Sendable {
+        let url: URL
+        let markdown: String
+    }
+
+    let sequence: UInt64
+    let versions: [UUID: UInt64]
+    let rootURL: URL
+    let files: [MarkdownFile]
+    let manifest: StoreManifest
+
+    func write() throws {
+        for file in files {
+            try FileManager.default.createDirectory(at: file.url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(file.markdown.utf8).write(to: file.url, options: .atomic)
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(manifest)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        try data.write(to: rootURL.appendingPathComponent("manifest.json"), options: .atomic)
     }
 }

@@ -13,11 +13,12 @@ let activeLinkMetadata={id:null,documents:[]}, pendingLinkMetadata=null;
 const localizedExtension = new Compartment();
 let stableSelection = null, suppressedSelection = null, toolbarFrame = 0;
 const pendingImages = new Map();
+let aiPendingPlugin=null;
 const fallback = {bold:'Bold', italic:'Italic', strikethrough:'Strikethrough', heading1:'Heading 1', heading2:'Heading 2', quote:'Quote', code:'Code', link:'Link', wikiAction:'Wiki', optimizeAction:'Optimize', editSource:'Edit source', importImage:'Import image', selectionToolbar:'Text formatting', busy:'Working…', imageAlt:'Image', table:'Table', linkOpenNote:'Notiz öffnen', linkOpenWiki:'Wiki-Seite öffnen', linkCreateMissing:'Nicht gefunden – mit ⌘-Klick erstellen', linkAmbiguous:'Mehrdeutiger Link', linkExternal:'Externen Link öffnen', linkSectionNotes:'Notizen', linkSectionWiki:'Wiki'};
 const tr = key => strings['editor.' + key] || fallback[key] || key;
 const post = message => window.webkit?.messageHandlers?.still?.postMessage(message);
-// Only a short visual caret overlay moves. CodeMirror selection, input and its
-// normal cursor/blink stay authoritative; every non-typing interaction snaps.
+// The caret overlay only adds a soft visual trail; CodeMirror remains the
+// authority for selection, input, and the native caret.
 const motionPreference=window.matchMedia('(prefers-reduced-motion: reduce)');
 const reducedMotion=()=>motionPreference.matches||document.documentElement.dataset.reduceMotion==='true';
 let caretMotion=null;
@@ -80,17 +81,19 @@ const caretMotionPlugin=ViewPlugin.fromClass(class {
           if(!unchanged||scrolled){this.snap();this.lastRect=target;}
           return;
         }
-        const canMove=animate&&!scrolled&&!reducedMotion()&&!this.composing&&!this.editor.composing&&visual&&Math.abs(visual.top-target.top)<1&&Math.abs(visual.left-target.left)<=96&&Math.abs(visual.left-target.left)>.2;
+        const distance=visual?Math.abs(visual.left-target.left):0;
+        const canMove=animate&&!scrolled&&!reducedMotion()&&!this.composing&&!this.editor.composing&&visual&&Math.abs(visual.top-target.top)<1&&distance<=96&&distance>.2;
         this.animation?.cancel();this.animation=null;
         this.lastRect=target;
         if(!canMove){this.overlay.hidden=true;this.editor.dom.classList.remove('still-caret-moving');return;}
         this.overlay.hidden=false;this.editor.dom.classList.add('still-caret-moving');
         this.overlay.style.height=`${target.bottom-target.top}px`;
         this.overlay.style.transform=`translate3d(${target.left}px,${target.top}px,0)`;
+        const duration=Math.round(Math.min(198,184+Math.min(14,distance*.22)));
         const animation=this.overlay.animate([
           {transform:`translate3d(${visual.left}px,${target.top}px,0)`},
           {transform:`translate3d(${target.left}px,${target.top}px,0)`}
-        ],{duration:115,easing:'cubic-bezier(.22,.61,.36,1)'});
+        ],{duration,easing:'cubic-bezier(.22,.61,.36,1)'});
         this.animation=animation;
         animation.finished.then(()=>{if(this.animation===animation){this.animation=null;this.overlay.hidden=true;this.editor.dom.classList.remove('still-caret-moving');}},()=>{});
       }
@@ -98,11 +101,29 @@ const caretMotionPlugin=ViewPlugin.fromClass(class {
   }
   destroy(){this.snap();this.overlay.remove();if(caretMotion===this)caretMotion=null;}
 });
-motionPreference.addEventListener('change',()=>{caretMotion?.snap();if(reducedMotion()&&toolbar.dataset.state==='closing')hideToolbar(true);});
+motionPreference.addEventListener('change',()=>{caretMotion?.snap();if(reducedMotion()){clearTypingReveal(view);if(toolbar.dataset.state==='closing')hideToolbar(true);}});
 
 const foldEffect = StateEffect.define();
 const focusEffect = StateEffect.define();
 const linkMetadataEffect = StateEffect.define();
+const setAIPendingEffect=StateEffect.define();
+const clearAIPendingEffect=StateEffect.define();
+const aiPendingField=StateField.define({
+  create:()=>null,
+  update(value,transaction) {
+    let next=value;
+    if(value&&transaction.docChanged) {
+      const from=transaction.changes.mapPos(value.from,1);
+      const to=value.from===value.to?from:transaction.changes.mapPos(value.to,-1);
+      next=to>=from&&transaction.state.doc.sliceString(from,to)===value.text?{...value,from,to}:null;
+    }
+    for(const effect of transaction.effects) {
+      if(effect.is(clearAIPendingEffect))next=null;
+      else if(effect.is(setAIPendingEffect))next=effect.value;
+    }
+    return next;
+  }
+});
 const linkMetadataField = StateField.define({
   create:()=>activeLinkMetadata.id===documentId?activeLinkMetadata:{id:documentId,documents:[]},
   update(value,transaction) {
@@ -117,19 +138,78 @@ const focusField = StateField.define({
     return value;
   }
 });
+const typingRevealEffect=StateEffect.define();
+const clearTypingRevealEffect=StateEffect.define();
+let nextTypingRevealId=0;
+const typingRevealDelay=30,typingRevealFade=60;
+// Display-only marks preserve their first input timestamp so recreated Markdown spans can resume the same fade.
+const typingRevealField=StateField.define({
+  create:()=>[],
+  update(value,transaction) {
+    if(transaction.effects.some(effect=>effect.is(clearTypingRevealEffect))||transaction.effects.some(effect=>effect.is(focusEffect)&&!effect.value)||transaction.selection&&!transaction.docChanged)return [];
+    let next=value;
+    for(const effect of transaction.effects)if(effect.is(typingRevealEffect)) {
+      const {id,remove}=effect.value;
+      next=remove?next.filter(range=>range.id!==id):next.map(range=>range.id===id?{...range,stage:'revealing'}:range);
+    }
+    if(transaction.docChanged) {
+      const event=transaction.annotation(Transaction.userEvent),changes=[];
+      transaction.changes.iterChanges((from,to,fromNew,toNew)=>changes.push({from,to,fromNew,toNew}));
+      const ordinaryTyping=typeof event==='string'&&event.startsWith('input.type')&&!event.includes('compose');
+      const selection=transaction.selection;
+      if(!ordinaryTyping||event!=='input.type'||changes.length!==1||changes[0].from!==changes[0].to||!transaction.startState.selection.main.empty||!selection?.main.empty||transaction.state.selection.ranges.length!==1||!transaction.state.field(focusField)||caretMotion?.composing||caretMotion?.editor?.composing||reducedMotion())return [];
+      const change=changes[0],text=transaction.state.doc.sliceString(change.fromNew,change.toNew);
+      if(!text||text.includes('\n')||text.includes('\r'))return [];
+      const mapped=next.flatMap(range=>{
+        const changed=changes.some(item=>item.from<range.to&&item.to>range.from||item.from===item.to&&item.from>range.from&&item.from<range.to);
+        if(changed)return [];
+        const from=transaction.changes.mapPos(range.from,1),to=transaction.changes.mapPos(range.to,-1);
+        return to>from?[{...range,from,to}]:[];
+      });
+      return [...mapped,{id:++nextTypingRevealId,from:change.fromNew,to:change.toNew,stage:'waiting',startedAt:performance.now()}];
+    }
+    return next;
+  },
+  provide:field=>EditorView.decorations.from(field,ranges=>Decoration.set(ranges.map(range=>Decoration.mark({class:`still-typed-glyph still-typed-glyph--${range.stage}`,attributes:{'data-still-reveal-id':String(range.id),...(range.stage==='revealing'?{style:`animation-delay:-${Math.max(0,performance.now()-range.startedAt-typingRevealDelay)}ms`}:{})}}).range(range.from,range.to)),true))
+});
+const typingRevealTimerPlugin=ViewPlugin.fromClass(class {
+  constructor(view){this.view=view;this.timers=new Map();this.sync();}
+  update(){this.sync();}
+  sync() {
+    const ranges=this.view.state.field(typingRevealField),active=new Set(ranges.map(range=>range.id));
+    for(const [id,timer] of this.timers)if(!active.has(id)){clearTimeout(timer);this.timers.delete(id);}
+    for(const range of ranges)if(!this.timers.has(range.id)) {
+      const reveal=range.stage==='waiting',due=range.startedAt+typingRevealDelay+(reveal?0:typingRevealFade);
+      const timer=setTimeout(()=>{
+        this.timers.delete(range.id);
+        if(this.view.state.field(typingRevealField).some(current=>current.id===range.id))this.view.dispatch({effects:typingRevealEffect.of(reveal?{id:range.id}:{id:range.id,remove:true})});
+      },Math.max(0,due-performance.now()));
+      this.timers.set(range.id,timer);
+    }
+  }
+  destroy(){for(const timer of this.timers.values())clearTimeout(timer);this.timers.clear();}
+});
+function clearTypingReveal(editor) {
+  if(editor.state.field(typingRevealField).length)editor.dispatch({effects:clearTypingRevealEffect.of(null)});
+}
 const foldField = StateField.define({
   create: () => new Map(),
   update(value, transaction) {
-    let next = new Map([...value].map(([pos, closed]) => [transaction.changes.mapPos(pos), closed]));
-    for (const effect of transaction.effects) if (effect.is(foldEffect)) next.set(effect.value.pos, effect.value.closed);
+    let next=value;
+    if(transaction.docChanged)next=new Map([...value].map(([pos,closed])=>[transaction.changes.mapPos(pos),closed]));
+    for(const effect of transaction.effects)if(effect.is(foldEffect)){if(next===value)next=new Map(value);next.set(effect.value.pos,effect.value.closed);}
     return next;
   }
 });
-const intersectsSelectionLines = (state, from, to) => state.field(focusField) && state.selection.ranges.some(range => {
-  const first = state.doc.lineAt(range.from).from;
-  const last = state.doc.lineAt(range.to).to;
-  return from <= last && to >= first;
-});
+function selectionLines(state) {
+  if(!state.field(focusField))return {key:'',ranges:[]};
+  const ranges=state.selection.ranges.map(range=>{
+    const first=state.doc.lineAt(range.from),last=state.doc.lineAt(range.to);
+    return {first:first.number,last:last.number,from:first.from,to:last.to};
+  });
+  return {key:ranges.map(range=>`${range.first}:${range.last}`).join(','),ranges};
+}
+const intersectsSelectionLines = (activeLines, from, to) => activeLines.ranges.some(range=>from<=range.to&&to>=range.from);
 function editSource(view, pos) {
   view.dispatch({selection: {anchor: pos}, scrollIntoView: true});
   view.focus();
@@ -230,44 +310,135 @@ function folderPathFor(document) {
   if(document.folders?.length)return document.folders.join('/');
   return normalizeTarget(document.target).split('/').slice(1,-1).join('/');
 }
-function resolveWikiTarget(target, metadata) {
-  const normalized=targetKey(normalizeTarget(target));
-  if(normalized===null)return {status:'missing',document:null};
-  const docs=metadata?.documents||[];
-  const exact=docs.filter(document=>targetKey(normalizeTarget(document.target))===normalized);
-  if(exact.length===1)return {status:'resolved',document:exact[0]};
-  if(exact.length>1)return {status:'ambiguous',document:null};
-  if(target.includes('/'))return {status:'missing',document:null};
-  const decoded=decodeOnce(target);
-  if(decoded===null)return {status:'missing',document:null};
-  const matches=docs.filter(document=>foldText(document.title)===foldText(target)||foldText(document.title)===foldText(decoded));
-  if(matches.length===1)return {status:'resolved',document:matches[0]};
-  if(!matches.length)return {status:'missing',document:null};
+const linkResolverCache=new WeakMap();
+const emptyLinkMetadata={id:null,documents:[]};
+const missingWikiTarget={status:'missing',document:null},ambiguousWikiTarget={status:'ambiguous',document:null};
+function addIndexValue(index,key,document) {
+  if(key===null)return;
+  let matches=index.get(key);
+  if(!matches)index.set(key,matches=[]);
+  matches.push(document);
+}
+function compileWikiResolver(metadata) {
+  metadata=metadata&&typeof metadata==='object'?metadata:emptyLinkMetadata;
+  let resolver=linkResolverCache.get(metadata);
+  if(resolver)return resolver;
+  const docs=metadata.documents||[],targets=new Map(),titles=new Map(),folders=new Map(),resolutionCache=new Map();
+  for(const document of docs) {
+    addIndexValue(targets,targetKey(normalizeTarget(document.target)),document);
+    addIndexValue(titles,foldText(document.title),document);
+    folders.set(document,foldText(folderPathFor(document)));
+  }
   const source=docs.find(document=>document.id===metadata.id);
-  if(source) {
-    const folder=foldText(folderPathFor(source)),inFolder=matches.filter(document=>document.section===source.section&&foldText(folderPathFor(document))===folder);
-    if(inFolder.length===1)return {status:'resolved',document:inFolder[0]};
-    const inSection=matches.filter(document=>document.section===source.section);
-    if(inSection.length===1)return {status:'resolved',document:inSection[0]};
-  }
-  return {status:'ambiguous',document:null};
+  const sourceFolder=source?folders.get(source):null;
+  resolver=target=>{
+    if(resolutionCache.has(target))return resolutionCache.get(target);
+    let resolution;
+    const normalized=targetKey(normalizeTarget(target));
+    if(normalized===null)resolution=missingWikiTarget;
+    else {
+      const exact=targets.get(normalized)||[];
+      if(exact.length===1)resolution={status:'resolved',document:exact[0]};
+      else if(exact.length>1)resolution=ambiguousWikiTarget;
+      else if(target.includes('/'))resolution=missingWikiTarget;
+      else {
+        const decoded=decodeOnce(target);
+        if(decoded===null)resolution=missingWikiTarget;
+        else {
+          const matches=[],seen=new Set();
+          for(const key of new Set([foldText(target),foldText(decoded)]))for(const document of titles.get(key)||[])if(!seen.has(document)){seen.add(document);matches.push(document);}
+          if(matches.length===1)resolution={status:'resolved',document:matches[0]};
+          else if(!matches.length)resolution=missingWikiTarget;
+          else if(source) {
+            const inFolder=matches.filter(document=>document.section===source.section&&folders.get(document)===sourceFolder);
+            if(inFolder.length===1)resolution={status:'resolved',document:inFolder[0]};
+            else {
+              const inSection=matches.filter(document=>document.section===source.section);
+              resolution=inSection.length===1?{status:'resolved',document:inSection[0]}:ambiguousWikiTarget;
+            }
+          } else resolution=ambiguousWikiTarget;
+        }
+      }
+    }
+    resolutionCache.set(target,resolution);
+    return resolution;
+  };
+  linkResolverCache.set(metadata,resolver);
+  return resolver;
 }
-function codeAndImageRanges(state) {
-  const ranges=[];
+function resolveWikiTarget(target,metadata) { return compileWikiResolver(metadata)(target); }
+
+const documentAnalysisCache=new WeakMap();
+const codeAndImageNames=new Set(['FencedCode','CodeBlock','InlineCode','Image']);
+function mergeRanges(ranges) {
+  ranges.sort((left,right)=>left[0]-right[0]||left[1]-right[1]);
+  const merged=[];
+  for(const [from,to] of ranges) {
+    const previous=merged.at(-1);
+    if(previous&&from<=previous[1])previous[1]=Math.max(previous[1],to);
+    else merged.push([from,to]);
+  }
+  return merged;
+}
+function rangeIndex(ranges) {
+  const sorted=[...ranges].sort((left,right)=>left[0]-right[0]||left[1]-right[1]),prefixEnds=[];
+  let maximum=-1;
+  for(const [,to] of sorted){maximum=Math.max(maximum,to);prefixEnds.push(maximum);}
+  return {ranges:sorted,prefixEnds};
+}
+function rangeIndexContains(index,from,to) {
+  let low=0,high=index.ranges.length;
+  while(low<high){const middle=(low+high)>>1;if(index.ranges[middle][0]<=from)low=middle+1;else high=middle;}
+  return low>0&&index.prefixEnds[low-1]>=to;
+}
+function rangeIndexOverlaps(index,from,to) {
+  let low=0,high=index.ranges.length;
+  while(low<high){const middle=(low+high)>>1;if(index.ranges[middle][0]<to)low=middle+1;else high=middle;}
+  return low>0&&index.prefixEnds[low-1]>from;
+}
+function documentAnalysis(state,source) {
+  const doc=state.doc,tree=syntaxTree(state);
+  let byTree=documentAnalysisCache.get(doc);
+  if(!byTree)documentAnalysisCache.set(doc,byTree=new WeakMap());
+  const cached=byTree.get(tree);
+  if(cached)return cached;
+  const raw=source??doc.toString(),lines=[],codeLines=new Set(),fenceRanges=[],codeRanges=[];
   let fence=null,fenceStart=0;
-  for(let number=1;number<=state.doc.lines;number++) {
-    const line=state.doc.line(number),marker=line.text.match(/^ {0,3}(`{3,}|~{3,})/);
+  for(let number=1;number<=doc.lines;number++) {
+    const line=doc.line(number),marker=line.text.match(/^ {0,3}(`{3,}|~{3,})/);
+    const item={number,line,from:line.from,to:line.to,text:line.text,marker,heading:line.text.match(/^(#{1,6})\s+/),quote:line.text.match(/^(\s*>\s?)+/),rule:/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(line.text),tableSeparator:number<doc.lines&&/^\s*\|?\s*:?-{3,}:?\s*\|/.test(doc.line(number+1).text)};
+    lines.push(item);
     if(fence) {
-      if(marker&&marker[1][0]===fence[0]&&marker[1].length>=fence.length){ranges.push([fenceStart,line.to]);fence=null;}
-    } else if(marker){fence=marker[1];fenceStart=line.from;}
-    else if(/^ {4,}\S|^\t\S/.test(line.text))ranges.push([line.from,line.to]);
+      codeLines.add(number);
+      if(marker&&marker[1][0]===fence[0]&&marker[1].length>=fence.length){fenceRanges.push([fenceStart,line.to]);codeRanges.push([fenceStart,line.to]);fence=null;}
+    } else if(marker){fence=marker[1];fenceStart=line.from;codeLines.add(number);}
+    else if(/^ {4,}\S|^\t\S/.test(line.text))codeRanges.push([line.from,line.to]);
   }
-  if(fence)ranges.push([fenceStart,state.doc.length]);
-  syntaxTree(state).iterate({enter(node){
-    if(['FencedCode','CodeBlock','InlineCode','Image'].includes(node.name)) {ranges.push([node.from,node.to]);return false;}
+  if(fence){fenceRanges.push([fenceStart,doc.length]);codeRanges.push([fenceStart,doc.length]);}
+  const syntaxNodes=[];
+  tree.iterate({enter(node){
+    if(codeAndImageNames.has(node.name))codeRanges.push([node.from,node.to]);
+    if(node.name==='FencedCode'||node.name==='CodeBlock')return false;
+    let depth=0;for(let parent=node.node.parent;parent;parent=parent.parent)depth++;
+    syntaxNodes.push({from:node.from,to:node.to,name:node.name,parentName:node.node.parent?.name,node:node.node,depth});
+    if(node.name==='Image')return false;
   }});
-  return ranges;
+  const details=[];
+  const detailsPattern=/<details\b[^>]*>\s*<summary\b[^>]*>([^]*?)<\/summary>/gi;
+  let match;
+  while((match=detailsPattern.exec(raw))) {
+    const from=match.index,openEnd=detailsPattern.lastIndex;
+    let depth=1,closeStart=-1,closeEnd=-1;
+    const tags=/<\/?details\b[^>]*>/gi;tags.lastIndex=openEnd;
+    let tag;
+    while((tag=tags.exec(raw))){depth+=/^<\//.test(tag[0])?-1:1;if(!depth){closeStart=tag.index;closeEnd=tags.lastIndex;break;}}
+    details.push({from,openEnd,closeStart,closeEnd,match:match[0],title:match[1],insideFence:fenceRanges.some(([fromFence,toFence])=>from>=fromFence&&from<toFence)});
+  }
+  const analysis={doc,tree,raw,lines,codeLines,fenceRanges,codeAndImageRanges:mergeRanges(codeRanges),syntaxNodes,details,wikiLinks:null,markdownLinks:null};
+  byTree.set(tree,analysis);
+  return analysis;
 }
+function codeAndImageRanges(state) { return documentAnalysis(state).codeAndImageRanges; }
 function escapedAt(source, position) {
   let slashes=0;for(let index=position-1;index>=0&&source[index]==='\\';index--)slashes++;
   return slashes%2===1;
@@ -286,13 +457,17 @@ function insideImageAlt(source, position) {
 function insideHtmlComment(source, position) {
   return source.lastIndexOf('<!--',position)>source.lastIndexOf('-->',position);
 }
-function wikiLinks(state) {
-  const source=state.doc.toString(), excluded=codeAndImageRanges(state), links=[];
+function wikiLinks(state,analysis) {
+  const source=analysis?.raw??state.doc.toString();
+  if(!source.includes('[[')){if(analysis)analysis.wikiLinks=[];return [];}
+  analysis=analysis||documentAnalysis(state,source);
+  if(analysis.wikiLinks)return analysis.wikiLinks;
+  const excluded=analysis.codeAndImageRanges,links=[];
   const pattern=/\[\[([^\n]*?)\]\]/g;
   let match;
   while((match=pattern.exec(source))) {
     const from=match.index,to=pattern.lastIndex;
-    if(escapedAt(source,from)||insideImageAlt(source,from)||insideHtmlComment(source,from)||excluded.some(([a,b])=>from>=a&&from<b))continue;
+    if(escapedAt(source,from)||insideImageAlt(source,from)||insideHtmlComment(source,from)||containsPosition(excluded,from))continue;
     if(match[1].includes('[['))continue;
     const separator=match[1].indexOf('|');
     const rawTarget=(separator<0?match[1]:match[1].slice(0,separator)).trim();
@@ -300,7 +475,12 @@ function wikiLinks(state) {
     const alias=separator<0?'':match[1].slice(separator+1).trim();
     links.push({from,to,original:match[0],target:rawTarget,alias});
   }
-  return links;
+  return analysis.wikiLinks=links;
+}
+function containsPosition(ranges,position) {
+  let low=0,high=ranges.length;
+  while(low<high){const middle=(low+high)>>1;if(ranges[middle][0]<=position)low=middle+1;else high=middle;}
+  const range=ranges[low-1];return !!range&&position<range[1];
 }
 function wikiCompletionContext(state, position=state.selection.main.head) {
   if(!state.selection.main.empty)return null;
@@ -309,7 +489,7 @@ function wikiCompletionContext(state, position=state.selection.main.head) {
   if(state.doc.sliceString(position,line.to).includes(']]'))return null;
   const from=line.from+match.index;
   const source=state.doc.toString();
-  if(escapedAt(source,from)||insideImageAlt(source,from)||insideHtmlComment(source,from)||codeAndImageRanges(state).some(([a,b])=>from>=a&&from<b))return null;
+  if(escapedAt(source,from)||insideImageAlt(source,from)||insideHtmlComment(source,from)||containsPosition(codeAndImageRanges(state),from))return null;
   if(match[1].includes('|'))return null;
   return {from,to:position,query:match[1]};
 }
@@ -352,20 +532,23 @@ function allowedExternalUrl(value) {
   } catch { return null; }
 }
 function markdownLinks(state) {
-  const links=[];
-  syntaxTree(state).iterate({enter(node){
-    if(node.name==='Image'||node.name==='FencedCode'||node.name==='CodeBlock'||node.name==='InlineCode')return false;
-    if(node.name==='Link'||node.name==='Autolink') {
-      const url=node.node.getChild('URL');
-      if(url)links.push({from:node.from,to:node.to,url:state.doc.sliceString(url.from,url.to),kind:node.name});
-      return false;
+  const analysis=documentAnalysis(state);
+  if(analysis.markdownLinks)return analysis.markdownLinks;
+  const links=[],skipped=[];
+  for(const item of analysis.syntaxNodes) {
+    const {from,to,name,parentName,node}=item;
+    if(skipped.some(([start,end])=>from>=start&&to<=end))continue;
+    if(name==='InlineCode'){skipped.push([from,to]);continue;}
+    if(name==='Link'||name==='Autolink') {
+      const url=node.getChild('URL');
+      if(url)links.push({from,to,url:state.doc.sliceString(url.from,url.to),kind:name});
+      skipped.push([from,to]);
+    } else if(name==='URL'&&!['Link','Autolink'].includes(parentName)) {
+      links.push({from,to,url:state.doc.sliceString(from,to),kind:'URL'});
+      skipped.push([from,to]);
     }
-    if(node.name==='URL'&&!['Link','Autolink'].includes(node.node.parent?.name)) {
-      links.push({from:node.from,to:node.to,url:state.doc.sliceString(node.from,node.to),kind:'URL'});
-      return false;
-    }
-  }});
-  return links;
+  }
+  return analysis.markdownLinks=links;
 }
 function linkAtPosition(state,position) {
   const wiki=wikiLinks(state).find(link=>position>=link.from&&position<=link.to);
@@ -425,104 +608,92 @@ class WikiLinkWidget extends WidgetType {
   }
   ignoreEvent() { return true; }
 }
-function decorationsFor(state) {
+function decorationsFor(state,analysis=documentAnalysis(state),activeLines=selectionLines(state)) {
   const ranges=[], occupied=[];
   const add=(from,to,decoration)=> { if(to>=from) ranges.push(decoration.range(from,to)); };
   const replace=(from,to,widget,block=false)=>add(from,to,Decoration.replace({widget,block}));
-  const raw=state.doc.toString(), wiki=wikiLinks(state), metadata=state.field(linkMetadataField);
-  const codeLines=new Set(); const codeRanges=[]; let fence=null, fenceStart=0;
-  for(let n=1;n<=state.doc.lines;n++) {
-    const line=state.doc.line(n), marker=line.text.match(/^ {0,3}(`{3,}|~{3,})/);
-    if(fence) {
-      codeLines.add(n);
-      if(marker&&marker[1][0]===fence[0]&&marker[1].length>=fence.length) {codeRanges.push([fenceStart,line.to]);fence=null;}
-    } else if(marker) {fence=marker[1];fenceStart=line.from;codeLines.add(n);}
-  }
-  if(fence)codeRanges.push([fenceStart,state.doc.length]);
+  const {raw,lines,codeLines,fenceRanges,syntaxNodes,details}=analysis;
+  const wiki=wikiLinks(state,analysis),metadata=state.field(linkMetadataField);
   // HTML details remains real Markdown source. Nested sections are folded independently when expanded.
-  const detailsPattern=/<details\b[^>]*>\s*<summary\b[^>]*>([^]*?)<\/summary>/gi;
-  let match;
-  while ((match=detailsPattern.exec(raw))) {
-    const from=match.index, openEnd=detailsPattern.lastIndex;
-    let depth=1, closeStart=-1, closeEnd=-1;
-    const tags=/<\/?details\b[^>]*>/gi; tags.lastIndex=openEnd;
-    let tag; while((tag=tags.exec(raw))) { depth+=/^<\//.test(tag[0])?-1:1; if(!depth){closeStart=tag.index;closeEnd=tags.lastIndex;break;} }
-    if(codeRanges.some(([a,b])=>from>=a&&from<b) || closeStart<0 || occupied.some(([a,b])=>from>=a&&from<b)) continue;
-    const closed=state.field(foldField).get(from) ?? !/<details\b[^>]*\bopen\b/i.test(match[0]);
-    const active=intersectsSelectionLines(state,from,openEnd) || (closed && intersectsSelectionLines(state,openEnd,closeEnd));
+  for(const detail of details) {
+    const {from,openEnd,closeStart,closeEnd,match,title}=detail;
+    if(detail.insideFence || closeStart<0 || occupied.some(([a,b])=>from>=a&&from<b)) continue;
+    const closed=state.field(foldField).get(from) ?? !/<details\b[^>]*\bopen\b/i.test(match);
+    const active=intersectsSelectionLines(activeLines,from,openEnd) || (closed && intersectsSelectionLines(activeLines,openEnd,closeEnd));
     if(active) continue;
     // Block replacements must begin and end at line boundaries.
     const startLine=state.doc.lineAt(from), endLine=state.doc.lineAt(closed?closeEnd:openEnd);
     if(startLine.from!==from || endLine.to!==(closed?closeEnd:openEnd)) continue;
-    replace(from,closed?closeEnd:openEnd,new DetailsWidget(from,match[1].replace(/<[^>]+>/g,'').trim(),closed),true);
+    replace(from,closed?closeEnd:openEnd,new DetailsWidget(from,title.replace(/<[^>]+>/g,'').trim(),closed),true);
     occupied.push([from,closed?closeEnd:openEnd]);
-    if(!closed && !intersectsSelectionLines(state,closeStart,closeEnd)) { replace(closeStart,closeEnd); occupied.push([closeStart,closeEnd]); }
+    if(!closed && !intersectsSelectionLines(activeLines,closeStart,closeEnd)) { replace(closeStart,closeEnd); occupied.push([closeStart,closeEnd]); }
   }
-  for(let n=1;n<=state.doc.lines;n++) {
-    const line=state.doc.line(n), text=line.text;
+  for(let index=0;index<lines.length;index++) {
+    const item=lines[index],{number:n,line,from,to,text}=item;
     if(occupied.some(([from,to])=>line.from>=from&&line.from<to)) continue;
-    const active=intersectsSelectionLines(state,line.from,line.to);
+    const active=intersectsSelectionLines(activeLines,line.from,line.to);
     if(codeLines.has(n)) {
       add(line.from,line.from,Decoration.line({class:'md-fenced'}));
-      if(/^ {0,3}(`{3,}|~{3,})/.test(text)&&!active)replace(line.from,line.to);
+      if(item.marker&&!active)replace(line.from,line.to);
       continue;
     }
-    if(n<state.doc.lines && text.includes('|') && /^\s*\|?\s*:?-{3,}:?\s*\|/.test(state.doc.line(n+1).text)) {
-      let end=n+1; while(end<state.doc.lines && state.doc.line(end+1).text.includes('|') && state.doc.line(end+1).text.trim()) end++;
-      const last=state.doc.line(end);
-      if(!intersectsSelectionLines(state,line.from,last.to)) {
-        const rows=[tableCells(text)]; for(let j=n+2;j<=end;j++) rows.push(tableCells(state.doc.line(j).text));
-        replace(line.from,last.to,new TableWidget(line.from,rows),true); occupied.push([line.from,last.to]); n=end; continue;
+    if(item.tableSeparator&&text.includes('|')) {
+      let lastIndex=index+1;
+      while(lastIndex+1<lines.length&&lines[lastIndex+1].text.includes('|')&&lines[lastIndex+1].text.trim())lastIndex++;
+      const last=lines[lastIndex].line;
+      if(!intersectsSelectionLines(activeLines,line.from,last.to)) {
+        const rows=[tableCells(text)];for(let j=index+2;j<=lastIndex;j++)rows.push(tableCells(lines[j].text));
+        replace(line.from,last.to,new TableWidget(line.from,rows),true);occupied.push([line.from,last.to]);index=lastIndex;continue;
       }
     }
-    const heading=text.match(/^(#{1,6})\s+/);
+    const heading=item.heading;
     if(heading) { add(line.from,line.from,Decoration.line({class:'md-heading md-h'+heading[1].length})); if(!active) replace(line.from,line.from+heading[0].length); }
-    const quote=text.match(/^(\s*>\s?)+/);
+    const quote=item.quote;
     if(quote) { add(line.from,line.from,Decoration.line({class:'md-quote'})); if(!active) replace(line.from,line.from+quote[0].length); }
-    if(/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(text) && !active) { add(line.from,line.from,Decoration.line({class:'md-rule'})); replace(line.from,line.to); continue; }
+    if(item.rule&&!active) { add(line.from,line.from,Decoration.line({class:'md-rule'})); replace(line.from,line.to); continue; }
   }
-  const wikiRanges=[];
+  const wikiRanges=[],blockOccupied=rangeIndex(occupied);
   for(const link of wiki) {
-    if(occupied.some(([from,to])=>link.from>=from&&link.to<=to))continue;
-    const active=intersectsSelectionLines(state,link.from,link.to), resolution=resolveWikiTarget(link.target,metadata);
+    if(rangeIndexContains(blockOccupied,link.from,link.to))continue;
+    const active=intersectsSelectionLines(activeLines,link.from,link.to), resolution=resolveWikiTarget(link.target,metadata);
     wikiRanges.push([link.from,link.to]);occupied.push([link.from,link.to]);
     if(active) {
       add(link.from,link.to,Decoration.mark({class:'md-wikilink-source',attributes:{'data-still-link-kind':'wiki','data-still-link-from':String(link.from),'data-still-link-to':String(link.to)}}));
     } else replace(link.from,link.to,new WikiLinkWidget(link,resolution,metadata.id));
   }
-  syntaxTree(state).iterate({enter(node) {
-    const {from,to,name}=node;
-    if(occupied.some(([a,b])=>from>=a&&to<=b))return false;
-    if(name==='FencedCode'||name==='CodeBlock')return false;
-    if(name==='Link'&&wikiRanges.some(([a,b])=>from<b&&to>a))return false;
-    const active=intersectsSelectionLines(state,from,to);
-    const classes={StrongEmphasis:'md-bold',Emphasis:'md-italic',Strikethrough:'md-strike',InlineCode:'md-code'};
+  const occupiedIndex=rangeIndex(occupied),wikiIndex=rangeIndex(wikiRanges),classes={StrongEmphasis:'md-bold',Emphasis:'md-italic',Strikethrough:'md-strike',InlineCode:'md-code'};
+  let skippedDepth=-1;
+  for(const item of syntaxNodes) {
+    const {from,to,name,node,parentName,depth}=item;
+    if(skippedDepth>=0){if(depth>skippedDepth)continue;skippedDepth=-1;}
+    if(rangeIndexContains(occupiedIndex,from,to)){skippedDepth=depth;continue;}
+    if(name==='Link'&&rangeIndexOverlaps(wikiIndex,from,to)){skippedDepth=depth;continue;}
+    const active=intersectsSelectionLines(activeLines,from,to);
     if(classes[name])add(from,to,Decoration.mark({class:classes[name]}));
     if(name==='Image') {
       if(!active) {
-        const url=node.node.getChild('URL');
+        const url=node.getChild('URL');
         const imageSource=state.doc.sliceString(from,to);
         const alt=imageSource.slice(2,imageSource.indexOf(']'));
         if(url)replace(from,to,new ImageWidget(from,state.doc.sliceString(url.from,url.to),alt));
       }
-      return false;
+      continue;
     }
-    const parentName=node.node.parent?.name;
     const externalNode=name==='Link'||name==='Autolink'||name==='URL'&&!['Link','Autolink'].includes(parentName);
     if(externalNode) {
-      const urlNode=name==='URL'?node.node:node.node.getChild('URL'),safeUrl=urlNode?allowedExternalUrl(state.doc.sliceString(urlNode.from,urlNode.to)):null;
+      const urlNode=name==='URL'?node:node.getChild('URL'),safeUrl=urlNode?allowedExternalUrl(state.doc.sliceString(urlNode.from,urlNode.to)):null;
       const labelMatch=state.doc.sliceString(from,to).match(/^\[([^\]]*)\]/),label=(labelMatch?.[1]||state.doc.sliceString(from,to)).replace(/[*_~`<>]/g,'');
       const attributes={'data-still-link-kind':'external','data-still-link-from':String(from),'data-still-link-to':String(to)};
       if(safeUrl)attributes['data-still-link-url']=safeUrl;
       if(safeUrl&&!active){attributes.role='link';attributes.tabindex='0';attributes['aria-label']=`${tr('linkExternal')}: ${label||safeUrl}`;}
       add(from,to,Decoration.mark({class:'md-link',attributes}));
       if(name==='Link'&&!active) {
-        let close=node.node.firstChild;
+        let close=node.firstChild;
         while(close && !(close.name==='LinkMark'&&state.doc.sliceString(close.from,close.to)===']'))close=close.nextSibling;
         if(close){replace(from,from+1);replace(close.from,to);}
       }
       if(name==='Autolink'&&!active&&safeUrl) {
-        const first=node.node.firstChild,last=node.node.lastChild;
+        const first=node.firstChild,last=node.lastChild;
         if(first?.name==='LinkMark'&&state.doc.sliceString(first.from,first.to)==='<')replace(first.from,first.to);
         if(last?.name==='LinkMark'&&state.doc.sliceString(last.from,last.to)==='>')replace(last.from,last.to);
       }
@@ -535,13 +706,94 @@ function decorationsFor(state) {
       const remainder=state.doc.sliceString(to,state.doc.lineAt(to).to);
       replace(from,to,/^\s+\[[ xX]\]/.test(remainder)?undefined:new BulletWidget());
     }
-  }});
+  }
+  const pending=state.field(aiPendingField);
+  if(pending&&pending.id===documentId&&pending.from>=0&&pending.to>pending.from&&state.doc.sliceString(pending.from,pending.to)===pending.text) {
+    add(pending.from,pending.to,Decoration.mark({class:'still-ai-pending-text'}));
+  }
   return Decoration.set(ranges,true);
 }
+function decorationState(state,active=selectionLines(state)) {
+  const analysis=documentAnalysis(state);
+  return {doc:state.doc,tree:analysis.tree,activeKey:active.key,decorations:decorationsFor(state,analysis,active)};
+}
 const decorationField=StateField.define({
-  create:decorationsFor,
-  update(value,transaction) { return transaction.docChanged || transaction.selection || transaction.effects.some(effect=>effect.is(foldEffect)||effect.is(focusEffect)||effect.is(linkMetadataEffect)) || syntaxTree(transaction.state)!==syntaxTree(transaction.startState) ? decorationsFor(transaction.state) : value; },
-  provide:field=>EditorView.decorations.from(field)
+  create:state=>decorationState(state),
+  update(value,transaction) {
+    const state=transaction.state,effectsChanged=transaction.effects.some(effect=>effect.is(foldEffect)||effect.is(focusEffect)||effect.is(linkMetadataEffect)||effect.is(setAIPendingEffect)||effect.is(clearAIPendingEffect));
+    if(transaction.docChanged||effectsChanged||syntaxTree(state)!==value.tree)return decorationState(state);
+    if(transaction.selection) {
+      const active=selectionLines(state);
+      return value.doc===state.doc&&value.activeKey===active.key?value:decorationState(state,active);
+    }
+    return value;
+  },
+  provide:field=>EditorView.decorations.from(field,value=>value.decorations)
+});
+const aiPendingViewPlugin=ViewPlugin.fromClass(class {
+  constructor(editor) {
+    this.editor=editor;this.pending=null;this.generation=0;
+    this.overlay=document.createElement('div');this.overlay.className='still-ai-loader';this.overlay.hidden=true;
+    this.overlay.setAttribute('role','status');this.overlay.setAttribute('aria-live','polite');this.overlay.setAttribute('aria-atomic','true');
+    this.orbit=document.createElement('span');this.orbit.className='still-ai-loader-orbit';this.orbit.setAttribute('aria-hidden','true');
+    this.core=document.createElement('span');this.core.className='still-ai-loader-core';this.core.setAttribute('aria-hidden','true');
+    this.label=document.createElement('span');this.label.className='still-sr-only';this.overlay.append(this.orbit,this.core,this.label);document.body.append(this.overlay);
+    this.onLayout=()=>this.measure();
+    editor.scrollDOM.addEventListener('scroll',this.onLayout,{passive:true});
+    window.addEventListener('scroll',this.onLayout,true);window.addEventListener('resize',this.onLayout);
+    this.resizeObserver=typeof ResizeObserver==='undefined'?null:new ResizeObserver(this.onLayout);
+    this.resizeObserver?.observe(editor.dom);this.resizeObserver?.observe(editor.scrollDOM);
+    aiPendingPlugin=this;this.sync();
+  }
+  update(update) {
+    const before=update.startState.field(aiPendingField),after=update.state.field(aiPendingField);
+    if(before!==after||update.docChanged||update.viewportChanged||update.geometryChanged)this.sync();
+  }
+  sync() {
+    const pending=this.editor.state.field(aiPendingField);
+    const active=pending&&pending.id===documentId&&pending.to>pending.from?pending:null;
+    this.editor.dom.classList.toggle('still-ai-pending',!!active);
+    this.pending=active;
+    if(!active){this.overlay.hidden=true;this.generation++;return;}
+    const status=aiLabel||tr('busy');this.label.textContent=status;this.overlay.setAttribute('aria-label',status);
+    this.measure();
+  }
+  measure() {
+    const pending=this.pending;if(!pending)return;
+    const editor=this.editor,doc=editor.state.doc,generation=++this.generation;
+    editor.requestMeasure({key:this,
+      read:current=>{
+        if(this.generation!==generation||this.pending!==pending||current.state.doc!==doc||current.state.field(aiPendingField)!==pending)return null;
+        let fragments=[];
+        try {
+          const start=current.domAtPos(pending.from,1),end=current.domAtPos(pending.to,-1),range=document.createRange();
+          range.setStart(start.node,start.offset);range.setEnd(end.node,end.offset);
+          fragments=[...range.getClientRects()].filter(rect=>rect.width||rect.height);
+        } catch {}
+        if(!fragments.length) {
+          const start=current.coordsAtPos(pending.from),end=current.coordsAtPos(pending.to);
+          if(start&&end)fragments=[{left:Math.min(start.left,end.left),right:Math.max(start.right,end.right),top:Math.min(start.top,end.top),bottom:Math.max(start.bottom,end.bottom)}];
+        }
+        if(!fragments.length)return null;
+        const left=Math.min(...fragments.map(rect=>rect.left)),right=Math.max(...fragments.map(rect=>rect.right));
+        const top=Math.min(...fragments.map(rect=>rect.top)),bottom=Math.max(...fragments.map(rect=>rect.bottom));
+        const bounds=current.dom.getBoundingClientRect();
+        if(bottom<Math.max(0,bounds.top)||top>window.innerHeight||right<0||left>window.innerWidth)return null;
+        return {left,right,top,bottom};
+      },
+      write:rect=>{
+        if(this.generation!==generation||this.pending!==pending)return;
+        if(!rect){this.overlay.hidden=true;return;}
+        const size=this.overlay.offsetWidth||24,x=(rect.left+rect.right-size)/2,y=(rect.top+rect.bottom-size)/2;
+        this.overlay.style.transform=`translate3d(${Math.round(x)}px,${Math.round(y)}px,0)`;this.overlay.hidden=false;
+      }
+    });
+  }
+  destroy() {
+    this.pending=null;this.generation++;this.editor.dom.classList.remove('still-ai-pending');
+    this.editor.scrollDOM.removeEventListener('scroll',this.onLayout);window.removeEventListener('scroll',this.onLayout,true);window.removeEventListener('resize',this.onLayout);
+    this.resizeObserver?.disconnect();this.overlay.remove();if(aiPendingPlugin===this)aiPendingPlugin=null;
+  }
 });
 function selectedSnapshot() {
   const {from,to}=view.state.selection.main;
@@ -579,7 +831,12 @@ function action(kind) {
   const selection=stableSelection;
   if(!snapshotValid(selection))return;
   if(kind==='wiki'||kind==='optimize') {
-    if(aiAvailable && !aiBusy) post({type:'action',action:kind,...selection});
+    if(aiAvailable&&!aiBusy) {
+      suppressedSelection=`${selection.id}:${selection.from}:${selection.to}`;
+      hideToolbar(true);aiBusy=true;aiLabel=tr('busy');makeToolbar();
+      view.dispatch({effects:setAIPendingEffect.of({...selection,kind})});
+      post({type:'action',action:kind,...selection});
+    }
   } else applyFormat(kind,selection);
 }
 function makeToolbar() {
@@ -615,6 +872,7 @@ function hideToolbar(immediate=false) {
 function scheduleToolbar() {if(!toolbarFrame)toolbarFrame=requestAnimationFrame(()=>{toolbarFrame=0;updateToolbar();});}
 function updateToolbar() {
   const selection=selectedSnapshot();
+  if(aiBusy){hideToolbar(true);return;}
   if(!selection || suppressedSelection===`${selection.id}:${selection.from}:${selection.to}` || (!view.hasFocus&&!toolbar.contains(document.activeElement))) {hideToolbar();return;}
   stableSelection=selection; showToolbar();
   const a=view.coordsAtPos(selection.from),b=view.coordsAtPos(selection.to),head=view.coordsAtPos(view.state.selection.main.head);
@@ -646,7 +904,7 @@ function localizedExtensions() {
 }
 function createState(doc) {
   return EditorState.create({doc,extensions:[
-    history(),drawSelection(),caretMotionPlugin,markdown({extensions:[GFM]}),focusField,foldField,linkMetadataField,decorationField,
+    history(),drawSelection(),caretMotionPlugin,markdown({extensions:[GFM]}),focusField,typingRevealField,foldField,aiPendingField,linkMetadataField,decorationField,typingRevealTimerPlugin,aiPendingViewPlugin,
     EditorView.lineWrapping,localizedExtension.of(localizedExtensions()),
     autocompletion({override:[wikiCompletionSource],maxRenderedOptions:12,interactionDelay:0}),
     keymap.of([
@@ -674,6 +932,7 @@ function createState(doc) {
       beforeinput(event) {if(caretMotion&&['insertText','deleteContentBackward'].includes(event.inputType)&&!event.isComposing)caretMotion.inputIntent=performance.now();return false;},
       pointerdown(event,editor) {
         caretMotion?.snap();
+        clearTypingReveal(editor);
         if(event.metaKey||event.ctrlKey) {
           const rendered=event.target.closest?.('[data-still-link-kind]');
           if(rendered&&!rendered.classList.contains('md-wiki-link')) {
@@ -687,14 +946,16 @@ function createState(doc) {
       },
       keydown(event,editor) {
         if(event.key==='Enter') {
+          clearTypingReveal(editor);
           const rendered=event.target.closest?.('[data-still-link-kind]');
           const activated=rendered?activateRenderedLink(rendered):event.metaKey||event.ctrlKey?activateAtPosition(editor.state.selection.main.head):false;
           if(activated){event.preventDefault();return true;}
         }
-        if(event.metaKey||event.ctrlKey||event.altKey||event.key.length!==1&&event.key!=='Backspace')caretMotion?.snap();
+        if(event.metaKey||event.ctrlKey||event.altKey||event.key.length!==1&&event.key!=='Backspace') {caretMotion?.snap();clearTypingReveal(editor);}
+        else if(event.key==='Backspace')clearTypingReveal(editor);
         return false;
       },
-      compositionstart() {if(caretMotion){caretMotion.composing=true;caretMotion.snap();}return false;},
+      compositionstart(_event,editor) {if(caretMotion){caretMotion.composing=true;caretMotion.snap();}clearTypingReveal(editor);return false;},
       compositionend() {if(caretMotion){caretMotion.composing=false;caretMotion.snap();caretMotion.measure(false);}return false;},
       focus(event,editor) {editor.dispatch({effects:focusEffect.of(true)});post({type:'focus',id:documentId,focused:true});return false;},
       blur(event,editor) {
@@ -720,7 +981,7 @@ function createState(doc) {
 }
 window.addEventListener('resize',()=>{caretMotion?.snap();scheduleToolbar();});
 window.addEventListener('scroll',()=>{caretMotion?.snap();scheduleToolbar();},true);
-window.addEventListener('blur',()=>{caretMotion?.snap();hideToolbar(true);});
+window.addEventListener('blur',()=>{caretMotion?.snap();clearTypingReveal(view);hideToolbar(true);});
 window.stillEditor={
   setDocument({id,markdown:source='',strings:localized={},theme='light',reduceMotion=false,aiAvailable:available=false}) {
     const sameDocument=id===documentId;
@@ -760,15 +1021,19 @@ window.stillEditor={
     scheduleWikiCompletion();
   },
   setAIState({busy=false,label}) {
-    const nextLabel=label??null;
-    if(aiBusy===busy&&aiLabel===nextLabel)return;
-    aiBusy=busy;aiLabel=nextLabel;makeToolbar();
+    const nextLabel=busy?(label??null):null;
+    const clearPending=!busy&&view.state.field(aiPendingField)!==null;
+    if(aiBusy===busy&&aiLabel===nextLabel&&!clearPending)return;
+    aiBusy=busy;aiLabel=nextLabel;
+    if(clearPending)view.dispatch({effects:clearAIPendingEffect.of(null)});
+    if(busy)hideToolbar(true);
+    makeToolbar();aiPendingPlugin?.sync();
     if(label){const button=toolbar.querySelector('[data-action="optimize"]');button.title=label;}
     scheduleToolbar();
   },
   replaceSelection({id,from,to,original,replacement}) {
     if(id!==documentId||typeof replacement!=='string'||!Number.isInteger(from)||!Number.isInteger(to)||from<0||to<from||to>view.state.doc.length||view.state.doc.sliceString(from,to)!==original)return false;
-    view.dispatch({changes:{from,to,insert:replacement},selection:{anchor:from,head:from+replacement.length},annotations:[Transaction.userEvent.of('input'),isolateHistory.of('full')]});view.focus();return true;
+    view.dispatch({changes:{from,to,insert:replacement},selection:{anchor:from+replacement.length},annotations:[Transaction.userEvent.of('input'),isolateHistory.of('full')],scrollIntoView:true});view.focus();return true;
   },
   insertMarkdown(text) {
     if(typeof text!=='string')return;
@@ -787,6 +1052,7 @@ window.stillEditor={
     const nextTheme=theme==='dark'?'dark':'light',nextMotion=String(!!reduceMotion);
     if(document.documentElement.dataset.theme!==nextTheme||document.documentElement.dataset.reduceMotion!==nextMotion)caretMotion?.snap();
     document.documentElement.dataset.theme=nextTheme;document.documentElement.dataset.reduceMotion=nextMotion;
+    if(reducedMotion())clearTypingReveal(view);
     if(reducedMotion()&&toolbar.dataset.state==='closing')hideToolbar(true);
   },
   undo(){view.focus();return undoCommand(view);},

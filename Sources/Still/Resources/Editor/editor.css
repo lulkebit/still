@@ -4,7 +4,7 @@
 @media(max-width:620px){.cm-content{padding-left:24px!important;padding-right:24px!important}#toolbar{gap:0;padding:4px}#toolbar button{min-width:24px;padding:0 4px;font-size:12px}.toolbar-separator{margin:0 2px}}@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}:root[data-reduce-motion=true] *{animation:none!important;transition:none!important}
 .md-fenced{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14px;line-height:1.7;background:var(--code);padding-left:14px!important;padding-right:14px!important}
 @media(max-width:480px){#toolbar{flex-wrap:wrap;width:max-content;max-width:calc(100vw - 40px)}#toolbar button{min-width:23px;padding:0 3px}}
-/* still. motion: 100ms feedback, 260ms toolbar entry, 130ms exit. Text never waits. */
+/* still. motion: 100ms feedback, 260ms toolbar entry, 130ms exit. Source input stays immediate. */
 :root{--motion-feedback:100ms;--motion-standard:220ms;--motion-exit:130ms;--motion-settle:cubic-bezier(.2,0,0,1);--motion-disclosure:cubic-bezier(.2,1.18,.4,1)}
 #toolbar{animation:none;transition:none;will-change:transform,opacity}
 #toolbar[data-entering=true][data-state=open]{animation:toolbar-in 260ms var(--motion-settle)}
@@ -39,3 +39,22 @@
 .cm-tooltip-autocomplete li[aria-selected=true]{background:rgba(255,255,255,.12)!important;color:var(--toolbar-text)!important}
 .cm-tooltip-autocomplete .cm-completionLabel{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cm-tooltip-autocomplete .cm-completionDetail{overflow:hidden;color:rgba(244,243,236,.62)!important;font-size:11px;font-style:normal!important;text-overflow:ellipsis;white-space:nowrap}
+#editor .cm-editor.still-ai-pending .cm-selectionBackground{background:transparent!important;opacity:0!important}
+.cm-editor.still-ai-pending ::selection{background:transparent!important}
+.still-ai-pending-text,.still-ai-pending-text *{color:color-mix(in srgb,var(--muted) 88%,var(--text))!important}
+.still-ai-pending-text{opacity:.58!important}
+.still-ai-loader{position:fixed;left:0;top:0;z-index:45;display:grid;width:24px;height:24px;place-items:center;transform-origin:center;border:1px solid color-mix(in srgb,var(--text) 12%,transparent);border-radius:50%;background:color-mix(in srgb,var(--toolbar) 88%,transparent);box-shadow:0 2px 9px color-mix(in srgb,var(--text) 18%,transparent),0 0 0 3px color-mix(in srgb,var(--accent) 13%,transparent);backdrop-filter:blur(5px);pointer-events:none;user-select:none;will-change:transform,box-shadow;animation:still-ai-surface-pulse 1.8s ease-in-out infinite}
+.still-ai-loader[hidden]{display:none}
+.still-ai-loader-orbit{display:block;width:14px;height:14px;border:1.5px solid color-mix(in srgb,var(--accent) 22%,transparent);border-top-color:var(--accent);border-right-color:var(--accent);border-radius:50%;animation:still-ai-spin 900ms linear infinite}
+.still-ai-loader-core{position:absolute;width:3px;height:3px;border-radius:50%;background:var(--accent);box-shadow:0 0 5px color-mix(in srgb,var(--accent) 75%,transparent);animation:still-ai-core-pulse 1.15s ease-in-out infinite}
+.still-sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+@keyframes still-ai-spin{to{transform:rotate(360deg)}}
+@keyframes still-ai-core-pulse{50%{opacity:.52;transform:scale(.72)}}
+@keyframes still-ai-surface-pulse{50%{box-shadow:0 3px 12px color-mix(in srgb,var(--text) 22%,transparent),0 0 0 5px color-mix(in srgb,var(--accent) 10%,transparent)}}
+@media(prefers-reduced-motion:reduce){.still-ai-loader,.still-ai-loader-orbit,.still-ai-loader-core{animation:none!important}}
+:root[data-reduce-motion=true] .still-ai-loader,:root[data-reduce-motion=true] .still-ai-loader-orbit,:root[data-reduce-motion=true] .still-ai-loader-core{animation:none!important}
+.still-typed-glyph--waiting{opacity:0}
+.still-typed-glyph--revealing{opacity:1;animation:still-typed-glyph-reveal 60ms ease-out both}
+@keyframes still-typed-glyph-reveal{from{opacity:0}to{opacity:1}}
+@media(prefers-reduced-motion:reduce){.still-typed-glyph--waiting{opacity:1!important}}
+:root[data-reduce-motion=true] .still-typed-glyph--waiting{opacity:1!important}

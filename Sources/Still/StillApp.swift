@@ -11,6 +11,9 @@ struct StillApp: App {
     var body: some Scene {
         Window(L10n.text("app.name"), id: "main") {
             ContentView(appModel: appModel, commandBus: editorCommands, noteNavigation: noteNavigation)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+                    appModel.store.flushPendingWrites()
+                }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     appModel.store.flushPendingWrites()
                 }

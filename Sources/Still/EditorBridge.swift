@@ -227,6 +227,8 @@ struct MarkdownEditor: NSViewRepresentable {
         private var isEditorFocused = false
         private var lastLinkDocumentsSourceID: UUID?
         private var lastLinkDocuments: [EditorLinkDocument]?
+        private var lastLinkCatalogRevision: UInt64?
+        private var lastAIState: (busy: Bool, label: String?)?
 
         init(appModel: StillAppModel, onWikiCreated: @escaping (Note) -> Void,
              onOpenWikiLink: @escaping (WikiLinkRequest) -> Void,
@@ -259,14 +261,18 @@ struct MarkdownEditor: NSViewRepresentable {
             let appearanceChanged = currentTheme != theme || currentReduceMotion != reduceMotion
             let availabilityChanged = currentAIAvailable != aiAvailable
             currentDocumentID = note.id
-            let linkDocuments = appModel.store.notes.map(EditorLinkDocument.init(note:))
-            if isReady && (lastLinkDocumentsSourceID != note.id || lastLinkDocuments != linkDocuments) {
+            if lastLinkCatalogRevision != appModel.store.linkCatalogRevision {
+                lastLinkDocuments = appModel.store.notes.map(EditorLinkDocument.init(note:))
+                lastLinkCatalogRevision = appModel.store.linkCatalogRevision
+                lastLinkDocumentsSourceID = nil
+            }
+            let linkDocuments = lastLinkDocuments ?? []
+            if isReady && lastLinkDocumentsSourceID != note.id {
                 invoke("setLinkDocuments", payload: [
                     "id": note.id.uuidString,
                     "documents": linkDocuments.map(\.payload)
                 ])
                 lastLinkDocumentsSourceID = note.id
-                lastLinkDocuments = linkDocuments
             }
             if documentChanged || availabilityChanged {
                 pushedMarkdown = note.markdown
@@ -274,6 +280,7 @@ struct MarkdownEditor: NSViewRepresentable {
                 currentTheme = theme
                 currentReduceMotion = reduceMotion
                 guard isReady else { return }
+                lastAIState = nil
                 invoke("setDocument", payload: [
                     "id": note.id.uuidString,
                     "markdown": note.markdown,
@@ -297,6 +304,8 @@ struct MarkdownEditor: NSViewRepresentable {
             switch type {
             case "ready":
                 isReady = true
+                lastAIState = nil
+                lastLinkDocumentsSourceID = nil
                 if let note = appModel.store.notes.first(where: { $0.id == currentDocumentID }) {
                     pushedMarkdown = nil
                     apply(note: note, colorScheme: currentTheme == "dark" ? .dark : .light,
@@ -347,6 +356,7 @@ struct MarkdownEditor: NSViewRepresentable {
         }
 
         func detach() {
+            appModel.store.flushPendingWrites()
             isEditorFocused = false
             commandBus?.clearHistoryHandlers()
             commandBus?.clearCommandHandler()
@@ -420,7 +430,8 @@ struct MarkdownEditor: NSViewRepresentable {
         }
 
         private func setAIState(busy: Bool, label: String?) {
-            guard isReady else { return }
+            guard isReady, lastAIState?.busy != busy || lastAIState?.label != label else { return }
+            lastAIState = (busy, label)
             var payload: [String: Any] = ["busy": busy]
             if let label { payload["label"] = label }
             invoke("setAIState", payload: payload)

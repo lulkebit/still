@@ -8,6 +8,18 @@ private enum FolderAction {
     case trash(Folder)
 }
 
+private enum StatusBannerSource: Hashable {
+    case loadError
+    case storeError
+    case aiError
+    case feedback
+}
+
+private struct StatusBannerSnapshot: Hashable {
+    let source: StatusBannerSource
+    let message: String
+}
+
 private enum SheetRoute: Identifiable {
     case createFolder(NoteSection, [String])
     case renameFolder(Folder)
@@ -45,6 +57,7 @@ struct ContentView: View {
     @State private var showNoteTrashConfirmation = false
     @State private var pendingWikiLink: WikiLinkRequest?
     @State private var showingMissingWikiLink = false
+    @State private var dismissedStatusBanners = Set<StatusBannerSnapshot>()
     let appModel: StillAppModel
     let commandBus: EditorCommandBus
     let noteNavigation: NoteNavigationHistory
@@ -99,6 +112,9 @@ struct ContentView: View {
         }
         .onChange(of: showTrash) { _, isTrash in
             if isTrash { selectedTrashID = store.trash.first?.id }
+        }
+        .onChange(of: statusBannerSources) { _, sources in
+            dismissedStatusBanners.formIntersection(Set(sources))
         }
         .sheet(isPresented: $showSettings) { AISettingsView(appModel: appModel) }
         .sheet(item: $sheetRoute, content: sheetContent)
@@ -242,20 +258,30 @@ struct ContentView: View {
     private var folderDeleteMessage: some View { Text(verbatim: L10n.text("dialog.deleteFolderBody")) }
     private var noteDeleteMessage: some View { Text(verbatim: L10n.text("dialog.deleteNoteBody")) }
 
+    private var statusBannerSources: [StatusBannerSnapshot] {
+        [
+            store.loadError.map { StatusBannerSnapshot(source: .loadError, message: $0) },
+            store.errorMessage.map { StatusBannerSnapshot(source: .storeError, message: $0) },
+            appModel.aiError.map { StatusBannerSnapshot(source: .aiError, message: $0) },
+            appModel.feedback.map { StatusBannerSnapshot(source: .feedback, message: $0) }
+        ].compactMap { $0 }
+    }
+
+    private var visibleStatusBanner: StatusBannerSnapshot? {
+        statusBannerSources.first { !dismissedStatusBanners.contains($0) }
+    }
+
     @ViewBuilder
     private var statusBanner: some View {
-        let message = store.loadError ?? store.errorMessage ?? appModel.aiError ?? appModel.feedback
-        if let message {
+        if let banner = visibleStatusBanner {
             HStack(spacing: 8) {
-                Image(systemName: store.loadError != nil || store.errorMessage != nil || appModel.aiError != nil ? "exclamationmark.circle" : "checkmark.circle")
-                Text(message).font(.system(size: 12)).lineLimit(2)
+                Image(systemName: banner.source == .feedback ? "checkmark.circle" : "exclamationmark.circle")
+                Text(banner.message).font(.system(size: 12)).lineLimit(2)
                 Spacer(minLength: 10)
-                if store.loadError == nil {
-                    Button {
-                        store.clearError()
-                        appModel.aiError = nil
-                        appModel.feedback = nil
-                    } label: { Image(systemName: "xmark").font(.system(size: 10, weight: .semibold)) }
+                if banner.source != .loadError {
+                    Button(action: dismissStatusBanners) {
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
+                    }
                     .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
                     .accessibilityLabel(L10n.text("action.dismiss"))
                 }
@@ -267,7 +293,25 @@ struct ContentView: View {
             .frame(maxWidth: 620)
             .transition(.move(edge: .top).combined(with: .opacity))
             .zIndex(3)
+            .task(id: banner) {
+                do {
+                    try await Task.sleep(for: .seconds(4))
+                } catch {
+                    return
+                }
+                guard visibleStatusBanner == banner else { return }
+                withAnimation(reduceMotion ? nil : .easeIn(duration: 0.16)) {
+                    dismissedStatusBanners.formUnion([banner])
+                }
+            }
         }
+    }
+
+    private func dismissStatusBanners() {
+        store.clearError()
+        appModel.aiError = nil
+        appModel.feedback = nil
+        dismissedStatusBanners.formIntersection(Set(statusBannerSources))
     }
 
     @ViewBuilder
@@ -552,7 +596,7 @@ private struct NavigationSidebar: View {
             .padding(.bottom, 20)
 
             VStack(spacing: 3) {
-                ForEach(WorkspaceSection.allCases) { section in
+                ForEach([WorkspaceSection.tasks, .notes, .wiki]) { section in
                     Button { onSelectSection(section) } label: {
                         HStack(spacing: 10) {
                             Image(systemName: icon(for: section)).font(.system(size: 14, weight: .regular)).frame(width: 17)

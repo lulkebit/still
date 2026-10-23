@@ -242,6 +242,8 @@ private struct StandaloneTaskRow: View {
     let onOpenNote: (UUID) -> Void
     let onDelete: () -> Void
     @State private var isWikiBusy = false
+    @State private var pendingAIOriginal: String?
+    @State private var pendingAIRange: NSRange?
     @State private var titleDraft = ""
     @FocusState private var titleFocused: Bool
 
@@ -293,14 +295,19 @@ private struct StandaloneTaskRow: View {
                         .onChange(of: titleFocused) { _, focused in if !focused { commitTitle() } }
                         .onChange(of: task.title) { _, value in if !titleFocused { titleDraft = value } }
                         .accessibilityIdentifier("task-edit-title-\(task.id.uuidString)")
-                    TaskDescriptionTextView(text: task.detail, onChange: updateDetail, onAIAction: performAI)
+                    TaskDescriptionTextView(
+                        text: task.detail,
+                        isBusy: isWikiBusy,
+                        isAIEnabled: appModel.store.settings.enabled && !appModel.aiBusy,
+                        busySelectionRange: pendingAIRange,
+                        busySourceText: pendingAIOriginal,
+                        reduceMotion: reduceMotion,
+                        onChange: updateDetail,
+                        onAIAction: performAI
+                    )
                         .frame(height: 100)
                         .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 7))
                         .accessibilityIdentifier("task-description-\(task.id.uuidString)")
-                    if isWikiBusy {
-                        Label(L10n.text("action.aiBusy"), systemImage: "circle.dotted")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
-                    }
                     HStack(spacing: 12) {
                         Picker(L10n.text("task.status"), selection: Binding(get: { task.status }, set: updateStatus)) {
                             ForEach(TaskStatus.allCases) { status in Text(L10n.text(status.localizationKey)).tag(status) }
@@ -336,6 +343,9 @@ private struct StandaloneTaskRow: View {
         }
         .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.90), value: isExpanded)
         .onAppear { titleDraft = task.title }
+        .onChange(of: task.detail) { _, detail in
+            if isWikiBusy && detail != pendingAIOriginal { finishAIAction() }
+        }
     }
 
     private func updateDetail(_ value: String) {
@@ -359,17 +369,24 @@ private struct StandaloneTaskRow: View {
     private func save(_ updated: TaskItem) { do { try appModel.store.updateTask(updated) } catch { appModel.store.report(error) } }
 
     private func performAI(_ action: String, selectedText: String, range: NSRange, applyReplacement: @escaping (String) -> Bool) {
-        guard !isWikiBusy else { return }
+        guard !isWikiBusy, !appModel.aiBusy, appModel.store.settings.enabled else { return }
         let original = task.detail
         guard range.location >= 0, range.length > 0, NSMaxRange(range) <= (original as NSString).length else { return }
         let source = (original as NSString).substring(with: range)
+        guard source == selectedText else {
+            appModel.aiError = L10n.text("error.aiSelectionChanged")
+            return
+        }
+        pendingAIOriginal = original
+        pendingAIRange = range
         isWikiBusy = true
         Task { @MainActor in
-            defer { isWikiBusy = false }
+            defer { finishAIAction() }
             do {
                 let outcome = try await appModel.performAIAction(action, noteID: task.id, selectedText: source)
                 switch outcome {
                 case .wiki(let notes):
+                    finishAIAction()
                     if let first = notes.first { onOpenNote(first.id) }
                 case .optimized(let replacement):
                     guard let current = appModel.store.tasks.first(where: { $0.id == task.id }),
@@ -384,10 +401,31 @@ private struct StandaloneTaskRow: View {
             } catch { appModel.aiError = L10n.message(for: error) }
         }
     }
+
+    private func finishAIAction() {
+        pendingAIOriginal = nil
+        pendingAIRange = nil
+        isWikiBusy = false
+    }
+}
+
+struct TaskTextSelectionSnapshot: Equatable {
+    let text: String
+    let range: NSRange
+
+    func matches(_ content: String) -> Bool {
+        range.location >= 0 && range.length > 0 && NSMaxRange(range) <= (content as NSString).length
+            && (content as NSString).substring(with: range) == text
+    }
 }
 
 private struct TaskDescriptionTextView: NSViewRepresentable {
     var text: String
+    var isBusy: Bool
+    var isAIEnabled: Bool
+    var busySelectionRange: NSRange?
+    var busySourceText: String?
+    var reduceMotion: Bool
     var onChange: (String) -> Void
     var onAIAction: (String, String, NSRange, @escaping (String) -> Bool) -> Void
 
@@ -421,6 +459,8 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
         view.autoresizingMask = [.width]
         view.textContainer?.widthTracksTextView = true
         view.string = text
+        view.isAIEnabled = isAIEnabled
+        view.setAIBusy(isBusy, selectionRange: busySelectionRange, sourceText: busySourceText, reduceMotion: reduceMotion)
         scroll.documentView = view
         context.coordinator.textView = view
         return scroll
@@ -433,7 +473,22 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
         view.onAIAction = { [weak coordinator = context.coordinator] action, selected, range, apply in
             coordinator?.onAIAction(action, selected, range, apply)
         }
-        if view.string != text, !view.hasMarkedText() { view.string = text }
+        view.isAIEnabled = isAIEnabled
+        if view.string != text, !view.hasMarkedText() {
+            if isBusy && text != busySourceText {
+                view.setAIBusy(false, selectionRange: nil, sourceText: nil, reduceMotion: true)
+            }
+            view.string = text
+        }
+        view.setAIBusy(isBusy, selectionRange: busySelectionRange, sourceText: busySourceText, reduceMotion: reduceMotion)
+    }
+
+    static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+        guard let view = scroll.documentView as? TaskSelectionTextView else { return }
+        view.delegate = nil
+        view.onAIAction = nil
+        view.setAIBusy(false, selectionRange: nil, sourceText: nil, reduceMotion: true)
+        coordinator.textView = nil
     }
 
     @MainActor
@@ -449,25 +504,107 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let view = notification.object as? NSTextView else { return }
+            if let taskTextView = view as? TaskSelectionTextView, taskTextView.isAIBusy {
+                taskTextView.setAIBusy(false, selectionRange: nil, sourceText: nil, reduceMotion: true)
+            }
             onChange(view.string)
         }
     }
 }
 
-private final class TaskSelectionTextView: NSTextView {
+final class TaskSelectionTextView: NSTextView {
     var onAIAction: ((String, String, NSRange, @escaping (String) -> Bool) -> Void)?
+    var isAIEnabled = false
+    private(set) var isAIBusy = false
+    private var contextualSelection: (text: String, range: NSRange)?
+    private var busySelectionRange: NSRange?
+    private var busyIndicator: AIBusyIndicatorView?
+
+    var hasBusyIndicator: Bool { busyIndicator != nil }
+
+    func setAIBusy(_ busy: Bool, selectionRange: NSRange?, sourceText: String?, reduceMotion: Bool) {
+        guard busy, sourceText == string, let selectionRange,
+              selectionRange.location >= 0, selectionRange.length > 0,
+              NSMaxRange(selectionRange) <= (string as NSString).length else {
+            clearAIBusyPresentation()
+            return
+        }
+
+        isAIBusy = true
+        if busySelectionRange != selectionRange {
+            clearBusyRangeAttributes()
+            busySelectionRange = selectionRange
+            layoutManager?.addTemporaryAttribute(
+                .foregroundColor,
+                value: NSColor.secondaryLabelColor,
+                forCharacterRange: selectionRange
+            )
+            let collapsedRange = NSRange(location: NSMaxRange(selectionRange), length: 0)
+            setSelectedRange(collapsedRange)
+        }
+        positionBusyIndicator(for: selectionRange, reduceMotion: reduceMotion)
+    }
+
+    private func clearAIBusyPresentation() {
+        isAIBusy = false
+        clearBusyRangeAttributes()
+        busyIndicator?.removeFromSuperview()
+        busyIndicator = nil
+    }
+
+    private func clearBusyRangeAttributes() {
+        let contentLength = (string as NSString).length
+        if contentLength > 0 {
+            layoutManager?.removeTemporaryAttribute(.foregroundColor, forCharacterRange: NSRange(location: 0, length: contentLength))
+        }
+        busySelectionRange = nil
+    }
+
+    private func positionBusyIndicator(for range: NSRange, reduceMotion: Bool) {
+        guard let layoutManager, let textContainer else { return }
+        let glyphRange = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+        let glyphBounds = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        let center = NSPoint(
+            x: glyphBounds.midX + textContainerOrigin.x,
+            y: glyphBounds.midY + textContainerOrigin.y
+        )
+        let size: CGFloat = 24
+        let indicator = busyIndicator ?? AIBusyIndicatorView(frame: .zero)
+        indicator.reduceMotion = reduceMotion
+        indicator.frame = NSRect(x: center.x - size / 2, y: center.y - size / 2, width: size, height: size)
+        if indicator.superview == nil { addSubview(indicator) }
+        busyIndicator = indicator
+    }
+
+    override func didChangeText() {
+        if isAIBusy { clearAIBusyPresentation() }
+        super.didChangeText()
+    }
+
+    override func layout() {
+        super.layout()
+        if let busySelectionRange,
+           busySelectionRange.location >= 0,
+           busySelectionRange.length > 0,
+           NSMaxRange(busySelectionRange) <= (string as NSString).length {
+            positionBusyIndicator(for: busySelectionRange, reduceMotion: busyIndicator?.reduceMotion ?? true)
+        } else if busySelectionRange != nil {
+            clearAIBusyPresentation()
+        }
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = NSMenu(title: "")
         let range = selectedRange()
         let selected = range.length > 0 && NSMaxRange(range) <= (string as NSString).length
             ? (string as NSString).substring(with: range) : ""
+        contextualSelection = selected.isEmpty ? nil : (selected, range)
         let wiki = NSMenuItem(title: L10n.text("action.wiki"), action: #selector(createWikiFromSelection), keyEquivalent: "")
         wiki.target = self
-        wiki.isEnabled = !selected.isEmpty
+        wiki.isEnabled = !selected.isEmpty && !isAIBusy && isAIEnabled
         let optimize = NSMenuItem(title: L10n.text("action.optimize"), action: #selector(optimizeSelection), keyEquivalent: "")
         optimize.target = self
-        optimize.isEnabled = !selected.isEmpty
+        optimize.isEnabled = !selected.isEmpty && !isAIBusy && isAIEnabled
         menu.addItem(wiki)
         menu.addItem(optimize)
         if let native = super.menu(for: event), !native.items.isEmpty {
@@ -483,16 +620,105 @@ private final class TaskSelectionTextView: NSTextView {
     @objc private func optimizeSelection() { perform("optimize") }
 
     private func perform(_ action: String) {
-        let range = selectedRange()
-        guard range.length > 0, NSMaxRange(range) <= (string as NSString).length else { return }
-        let originalSelection = (string as NSString).substring(with: range)
-        onAIAction?(action, originalSelection, range) { [weak self] replacement in
-            guard let self,
-                  NSMaxRange(range) <= (self.string as NSString).length,
-                  (self.string as NSString).substring(with: range) == originalSelection,
-                  self.shouldChangeText(in: range, replacementString: replacement) else { return false }
-            self.insertText(replacement, replacementRange: range)
-            return true
+        guard !isAIBusy, isAIEnabled else { return }
+        let selectionValue = contextualSelection ?? {
+            let range = selectedRange()
+            guard range.length > 0, NSMaxRange(range) <= (string as NSString).length else { return nil }
+            return ((string as NSString).substring(with: range), range)
+        }()
+        contextualSelection = nil
+        guard let selectionValue else { return }
+        let selection = TaskTextSelectionSnapshot(text: selectionValue.text, range: selectionValue.range)
+        guard selection.matches(string) else { return }
+        onAIAction?(action, selection.text, selection.range) { [weak self] replacement in
+            self?.replace(replacement, for: selection) ?? false
         }
+    }
+
+    @discardableResult
+    func replace(_ replacement: String, for selection: TaskTextSelectionSnapshot) -> Bool {
+        guard selection.matches(string),
+              performValidatedReplacement(
+                in: selection.range,
+                with: NSAttributedString(string: replacement)
+              ) else { return false }
+        let caret = selection.range.location + (replacement as NSString).length
+        let caretRange = NSRange(location: caret, length: 0)
+        setSelectedRange(caretRange)
+        window?.makeFirstResponder(self)
+        scrollRangeToVisible(caretRange)
+        return true
+    }
+}
+
+private final class AIBusyIndicatorView: NSView {
+    private let surface = CAShapeLayer()
+    private let ring = CAShapeLayer()
+    private let core = CAShapeLayer()
+    var reduceMotion = false { didSet { if oldValue != reduceMotion { updateMotion() } } }
+
+    override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer = CALayer()
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+        setAccessibilityLabel(L10n.text("action.aiBusy"))
+        setAccessibilityValue(L10n.text("action.aiBusy"))
+        layer?.addSublayer(surface)
+        layer?.addSublayer(ring)
+        layer?.addSublayer(core)
+        surface.fillColor = NSColor.windowBackgroundColor.withAlphaComponent(0.88).cgColor
+        surface.shadowColor = NSColor.black.withAlphaComponent(0.16).cgColor
+        surface.shadowOpacity = 1
+        surface.shadowRadius = 2
+        surface.shadowOffset = .zero
+        ring.fillColor = NSColor.clear.cgColor
+        ring.strokeColor = NSColor.controlAccentColor.cgColor
+        ring.lineWidth = 2.2
+        ring.lineCap = .round
+        ring.strokeEnd = 0.72
+        core.fillColor = NSColor.controlAccentColor.withAlphaComponent(0.30).cgColor
+        updateMotion()
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func layout() {
+        super.layout()
+        let surfaceRect = bounds.insetBy(dx: 0.6, dy: 0.6)
+        surface.frame = bounds
+        surface.path = CGPath(ellipseIn: surfaceRect, transform: nil)
+        ring.frame = bounds
+        ring.path = CGPath(ellipseIn: bounds.insetBy(dx: 3.1, dy: 3.1), transform: nil)
+        core.frame = bounds
+        core.path = CGPath(ellipseIn: NSRect(x: bounds.midX - 2.1, y: bounds.midY - 2.1, width: 4.2, height: 4.2), transform: nil)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    private func updateMotion() {
+        ring.removeAnimation(forKey: "turn")
+        core.removeAnimation(forKey: "pulse")
+        guard !reduceMotion else { return }
+
+        let turn = CABasicAnimation(keyPath: "transform.rotation.z")
+        turn.fromValue = 0
+        turn.toValue = Double.pi * 2
+        turn.duration = 1.25
+        turn.repeatCount = .infinity
+        turn.timingFunction = CAMediaTimingFunction(name: .linear)
+        ring.add(turn, forKey: "turn")
+
+        let pulse = CABasicAnimation(keyPath: "transform.scale")
+        pulse.fromValue = 0.82
+        pulse.toValue = 1.12
+        pulse.duration = 0.68
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        core.add(pulse, forKey: "pulse")
     }
 }

@@ -224,6 +224,157 @@ final class StillStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.appendingPathComponent("outside.png").path))
     }
 
+    @MainActor
+    func testTypingBurstIsVisibleImmediatelyAndAutosavesLatestAfterIdle() async throws {
+        let root = try temporaryWorkspace()
+        defer { removeWorkspace(root) }
+        let store = StillStore(rootURL: root, seedIfEmpty: false)
+        let note = try store.createNote(section: .notes, title: "Draft", markdown: "before")
+        let noteURL = markdownURL(note, root: root)
+        let manifestBefore = try Data(contentsOf: root.appendingPathComponent("manifest.json"))
+
+        for index in 0..<100 { store.updateMarkdown(id: note.id, markdown: "draft \(index)") }
+
+        XCTAssertEqual(store.notes.first?.markdown, "draft 99")
+        XCTAssertEqual(store.dirtyNoteIDs, [note.id])
+        XCTAssertEqual(try String(contentsOf: noteURL, encoding: .utf8), "before")
+        XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent("manifest.json")), manifestBefore)
+        try await waitForSave(store)
+        let reloaded = StillStore(rootURL: root, seedIfEmpty: false)
+        XCTAssertNil(reloaded.loadError)
+        XCTAssertEqual(reloaded.notes.first?.markdown, "draft 99")
+        XCTAssertEqual(reloaded.notes.first?.updatedAt, store.notes.first?.updatedAt)
+    }
+
+    @MainActor
+    func testContinuousTypingSavesBeforeTheUserStopsAndFlushSavesLastEdit() async throws {
+        let root = try temporaryWorkspace()
+        defer { removeWorkspace(root) }
+        let store = StillStore(rootURL: root, seedIfEmpty: false)
+        let note = try store.createNote(section: .notes, title: "Draft", markdown: "before")
+        for index in 0..<32 {
+            store.updateMarkdown(id: note.id, markdown: "draft \(index)")
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
+        // There was no 220 ms idle gap, yet the one-second maximum triggered a save.
+        let savedDuringTyping = try String(contentsOf: markdownURL(note, root: root), encoding: .utf8)
+        XCTAssertNotEqual(savedDuringTyping, "before")
+        store.updateMarkdown(id: note.id, markdown: "the final edit")
+        store.flushPendingWrites()
+        XCTAssertTrue(store.dirtyNoteIDs.isEmpty)
+        XCTAssertEqual(StillStore(rootURL: root, seedIfEmpty: false).notes.first?.markdown, "the final edit")
+        // Any already-enqueued completion must not undo the synchronous flush result.
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(store.dirtyNoteIDs.isEmpty)
+        XCTAssertEqual(try String(contentsOf: markdownURL(note, root: root), encoding: .utf8), "the final edit")
+    }
+
+    @MainActor
+    func testNoteSwitchAndStructuralWritesFlushPendingBodiesAndKeepOldPathsRemoved() async throws {
+        let root = try temporaryWorkspace()
+        defer { removeWorkspace(root) }
+        let store = StillStore(rootURL: root, seedIfEmpty: false)
+        let first = try store.createNote(section: .notes, title: "First", markdown: "before")
+        let second = try store.createNote(section: .notes, title: "Second", markdown: "second")
+        store.setLastOpenedNote(first.id)
+        store.updateMarkdown(id: first.id, markdown: "saved on switch")
+        store.setLastOpenedNote(second.id)
+        let switched = StillStore(rootURL: root, seedIfEmpty: false)
+        XCTAssertEqual(switched.notes.first(where: { $0.id == first.id })?.markdown, "saved on switch")
+        XCTAssertEqual(switched.lastOpenedNoteID, second.id)
+
+        store.updateMarkdown(id: first.id, markdown: "autosave snapshot")
+        try await Task.sleep(for: .milliseconds(230))
+        store.updateMarkdown(id: first.id, markdown: "latest before rename")
+        try store.renameNote(id: first.id, title: "Renamed")
+        var renamed = try XCTUnwrap(store.notes.first(where: { $0.id == first.id }))
+        let renamedURL = markdownURL(renamed, root: root)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markdownURL(first, root: root).path))
+        store.updateMarkdown(id: first.id, markdown: "latest before move")
+        try store.moveNote(id: first.id, section: .wiki, folders: ["Archive"])
+        renamed = try XCTUnwrap(store.notes.first(where: { $0.id == first.id }))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: renamedURL.path))
+        XCTAssertEqual(try String(contentsOf: markdownURL(renamed, root: root), encoding: .utf8), "latest before move")
+
+        store.updateMarkdown(id: first.id, markdown: "latest before trash")
+        try store.trashNote(id: first.id)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markdownURL(renamed, root: root).path))
+        XCTAssertTrue(store.dirtyNoteIDs.isEmpty)
+        try store.restoreTrashItem(id: first.id)
+        let reloaded = StillStore(rootURL: root, seedIfEmpty: false)
+        XCTAssertNil(reloaded.loadError)
+        XCTAssertEqual(reloaded.notes.first(where: { $0.id == first.id })?.markdown, "latest before trash")
+    }
+
+    @MainActor
+    func testPendingFolderEditsSurviveRenameAndTrashWithoutRecreatingFiles() async throws {
+        let root = try temporaryWorkspace()
+        defer { removeWorkspace(root) }
+        let store = StillStore(rootURL: root, seedIfEmpty: false)
+        let folder = try store.createFolder(section: .notes, parentPath: [], name: "Drafts")
+        let note = try store.createNote(section: .notes, folders: folder.path, title: "Draft", markdown: "before")
+        store.updateMarkdown(id: note.id, markdown: "before folder rename")
+        try store.renameFolder(folder, name: "Final")
+        let renamed = try XCTUnwrap(store.folders.first(where: { $0.name == "Final" }))
+        let movedNote = try XCTUnwrap(store.notes.first)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markdownURL(note, root: root).path))
+        XCTAssertEqual(StillStore(rootURL: root, seedIfEmpty: false).notes.first?.markdown, "before folder rename")
+        store.updateMarkdown(id: note.id, markdown: "before folder trash")
+        try store.trashFolder(renamed)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markdownURL(movedNote, root: root).path))
+        try store.restoreTrashItem(id: note.id)
+        XCTAssertEqual(StillStore(rootURL: root, seedIfEmpty: false).notes.first?.markdown, "before folder trash")
+    }
+
+    @MainActor
+    func testAutosaveFailureRetainsDirtyLatestTextAndFlushRetriesIt() async throws {
+        let root = try temporaryWorkspace()
+        defer { removeWorkspace(root) }
+        let store = StillStore(rootURL: root, seedIfEmpty: false)
+        let note = try store.createNote(section: .notes, title: "Draft", markdown: "before")
+        let manifestURL = root.appendingPathComponent("manifest.json")
+        let originalManifest = try Data(contentsOf: manifestURL)
+        try FileManager.default.removeItem(at: manifestURL)
+        try FileManager.default.createDirectory(at: manifestURL, withIntermediateDirectories: true)
+        store.updateMarkdown(id: note.id, markdown: "failed autosave")
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while store.errorMessage == nil && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNotNil(store.errorMessage)
+        XCTAssertEqual(store.dirtyNoteIDs, [note.id])
+        store.updateMarkdown(id: note.id, markdown: "newest unsaved text")
+        store.flushPendingWrites()
+        XCTAssertEqual(store.dirtyNoteIDs, [note.id])
+        XCTAssertThrowsError(try store.renameNote(id: note.id, title: "Should not rename"))
+        XCTAssertEqual(store.notes.first?.title, "Draft")
+        try FileManager.default.removeItem(at: manifestURL)
+        try originalManifest.write(to: manifestURL)
+
+        store.flushPendingWrites()
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertTrue(store.dirtyNoteIDs.isEmpty)
+        XCTAssertNil(store.errorMessage)
+        XCTAssertEqual(StillStore(rootURL: root, seedIfEmpty: false).notes.first?.markdown, "newest unsaved text")
+    }
+
+    @MainActor
+    private func waitForSave(_ store: StillStore) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !store.dirtyNoteIDs.isEmpty && ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertTrue(store.dirtyNoteIDs.isEmpty)
+        XCTAssertNil(store.errorMessage)
+    }
+
+    private func markdownURL(_ note: Note, root: URL) -> URL {
+        root.appending(path: PathSafety.safeRelativeMarkdownPath(section: note.section, folders: note.folders, title: note.title))
+    }
+
     private func temporaryWorkspace() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("StillTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

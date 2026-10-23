@@ -190,6 +190,35 @@ final class NoteLinkTests: XCTestCase {
         XCTAssertEqual(reloaded.notes.first(where: { $0.id == source.id })?.markdown, source.markdown)
     }
 
+    @MainActor
+    func testBacklinksRefreshForBodyCatalogAmbiguityAndRelocationChanges() throws {
+        let root = try temporaryWorkspace()
+        defer { removeWorkspace(root) }
+        let store = StillStore(rootURL: root, seedIfEmpty: false)
+        let target = try store.createNote(section: .wiki, folders: ["A"], title: "Topic")
+        let source = try store.createNote(section: .notes, title: "Start", markdown: "[[Topic]]")
+        XCTAssertEqual(store.backlinks(to: target).map(\.id), [source.id])
+        store.updateMarkdown(id: target.id, markdown: "Typing into the target keeps incoming links")
+        XCTAssertEqual(store.backlinks(to: target).map(\.id), [source.id])
+        let duplicate = try store.createNote(section: .wiki, folders: ["B"], title: "Topic")
+        XCTAssertTrue(store.backlinks(to: target).isEmpty)
+        try store.trashNote(id: duplicate.id)
+        XCTAssertEqual(store.backlinks(to: target).map(\.id), [source.id])
+        store.updateMarkdown(id: source.id, markdown: "No link now")
+        XCTAssertTrue(store.backlinks(to: target).isEmpty)
+        store.updateMarkdown(id: source.id, markdown: "[[wiki/A/Topic|restored link]]")
+        XCTAssertEqual(store.backlinks(to: target).map(\.id), [source.id])
+        try store.renameNote(id: target.id, title: "Renamed")
+        let renamed = try XCTUnwrap(store.notes.first(where: { $0.id == target.id }))
+        XCTAssertEqual(store.backlinks(to: renamed).map(\.id), [source.id])
+        try store.moveNote(id: source.id, section: .wiki, folders: ["Moved"])
+        XCTAssertEqual(store.backlinks(to: renamed).map(\.id), [source.id])
+        try store.trashNote(id: source.id)
+        XCTAssertTrue(store.backlinks(to: renamed).isEmpty)
+        try store.restoreTrashItem(id: source.id)
+        XCTAssertEqual(store.backlinks(to: renamed).map(\.id), [source.id])
+    }
+
     private func temporaryWorkspace() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("StillNoteLinkTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)

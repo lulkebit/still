@@ -9,7 +9,7 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
     var localizationKey: String { "nav.\(rawValue)" }
 }
 
-enum NoteSection: String, Codable, CaseIterable, Identifiable {
+enum NoteSection: String, Codable, CaseIterable, Identifiable, Sendable {
     case notes
     case wiki
 
@@ -44,7 +44,7 @@ struct Note: Identifiable, Equatable {
     }
 }
 
-struct Folder: Codable, Hashable, Identifiable {
+struct Folder: Codable, Hashable, Identifiable, Sendable {
     var section: NoteSection
     var path: [String]
 
@@ -52,7 +52,7 @@ struct Folder: Codable, Hashable, Identifiable {
     var name: String { path.last ?? "" }
 }
 
-enum TaskStatus: String, Codable, CaseIterable, Identifiable {
+enum TaskStatus: String, Codable, CaseIterable, Identifiable, Sendable {
     case open
     case waiting
     case done
@@ -61,7 +61,7 @@ enum TaskStatus: String, Codable, CaseIterable, Identifiable {
     var localizationKey: String { "task.status.\(rawValue)" }
 }
 
-enum TaskPriority: String, Codable, CaseIterable, Identifiable {
+enum TaskPriority: String, Codable, CaseIterable, Identifiable, Sendable {
     case low
     case normal
     case high
@@ -70,7 +70,7 @@ enum TaskPriority: String, Codable, CaseIterable, Identifiable {
     var localizationKey: String { "task.priority.\(rawValue)" }
 }
 
-struct TaskItem: Codable, Identifiable, Equatable {
+struct TaskItem: Codable, Identifiable, Equatable, Sendable {
     var id: UUID
     var title: String
     var detail: String
@@ -111,7 +111,7 @@ struct EmbeddedTask: Identifiable, Equatable {
     var isDone: Bool
 }
 
-struct AISettings: Codable, Equatable {
+struct AISettings: Codable, Equatable, Sendable {
     var baseURL: String
     var model: String
     var enabled: Bool
@@ -119,7 +119,7 @@ struct AISettings: Codable, Equatable {
     static let empty = AISettings(baseURL: "", model: "", enabled: false)
 }
 
-struct NoteIndexEntry: Codable, Equatable {
+struct NoteIndexEntry: Codable, Equatable, Sendable {
     var id: UUID
     var title: String
     var section: NoteSection
@@ -137,7 +137,7 @@ struct NoteIndexEntry: Codable, Equatable {
     }
 }
 
-struct TrashEntry: Codable, Identifiable, Equatable {
+struct TrashEntry: Codable, Identifiable, Equatable, Sendable {
     var id: UUID
     var title: String
     var section: NoteSection
@@ -147,7 +147,7 @@ struct TrashEntry: Codable, Identifiable, Equatable {
     var deletedAt: Date
 }
 
-struct StoreManifest: Codable {
+struct StoreManifest: Codable, Sendable {
     var formatVersion: Int
     var notes: [NoteIndexEntry]
     var folders: [Folder]

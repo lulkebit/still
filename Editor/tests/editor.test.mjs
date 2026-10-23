@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { chromium, webkit } from '@playwright/test';
 
 const distribution=new URL('../../Sources/Still/Resources/Editor/',import.meta.url);
@@ -99,9 +99,118 @@ test('selection toolbar preserves exact Unicode range and undo',async()=>{
   await page.locator('[data-action=optimize]').click();
   const action=await page.evaluate(()=>window.messages.filter(message=>message.type==='action').at(-1));
   assert.deepEqual(action,{type:'action',action:'optimize',id:'doc-1',from:7,to:17,text:'🪴 café 中文'});
+  assert.equal(await page.locator('#toolbar').isVisible(),false,'AI actions close the selection toolbar immediately');
+  await page.waitForFunction(()=>{const loader=document.querySelector('.still-ai-loader');return loader&&!loader.hidden;});
+  assert.ok(await page.locator('.still-ai-pending-text').count()>0);
   assert.equal(await page.locator('[data-action=optimize]').textContent(),'✧ Optimieren');
   await page.evaluate(()=>window.stillEditor.setAIState({busy:true}));
   assert.equal(await page.locator('[data-action=optimize]').isDisabled(),true);
+  await page.evaluate(()=>window.stillEditor.setAIState({busy:false}));
+  assert.equal(await page.locator('.still-ai-loader').isVisible(),false,'The native idle state clears transient AI feedback');
+  assert.equal(await page.locator('.still-ai-pending-text').count(),0);
+});
+test('Wiki and optimize feedback follows a Unicode multi-line selection and optimize undo restores it',async()=>{
+  const markdown='Intro 🌿\n選ばれた line\nTail',from=markdown.indexOf('🌿'),to=markdown.indexOf('\nTail'),original=markdown.slice(from,to);
+  for(const kind of ['wiki','optimize']) {
+    const id=`ai-${kind}`;await load(markdown,id);await select(from,to);
+    await page.locator(`[data-action=${kind}]`).click();
+    assert.equal(await page.locator('#toolbar').isVisible(),false,`${kind} closes the selection toolbar on click`);
+    const message=await page.evaluate(()=>window.messages.filter(item=>item.type==='action').at(-1));
+    assert.deepEqual(message,{type:'action',action:kind,id,from,to,text:original});
+    await page.waitForFunction(()=>{const loader=document.querySelector('.still-ai-loader');return loader&&!loader.hidden;});
+    const feedback=await page.evaluate(()=>{
+      const view=document.querySelector('.cm-content').cmTile.root.view,loader=document.querySelector('.still-ai-loader'),rects=[];
+      const from=view.state.selection.main.from,to=view.state.selection.main.to;
+      const start=view.domAtPos(from,1),end=view.domAtPos(to,-1),range=document.createRange();range.setStart(start.node,start.offset);range.setEnd(end.node,end.offset);
+      for(const rect of range.getClientRects())if(rect.width||rect.height)rects.push(rect);
+      const bounds={left:Math.min(...rects.map(rect=>rect.left)),right:Math.max(...rects.map(rect=>rect.right)),top:Math.min(...rects.map(rect=>rect.top)),bottom:Math.max(...rects.map(rect=>rect.bottom))};
+      const overlay=loader.getBoundingClientRect();
+      return {text:[...document.querySelectorAll('.still-ai-pending-text')].map(node=>node.textContent).join(' '),gray:getComputedStyle(document.querySelector('.still-ai-pending-text')).color,selectionBackground:getComputedStyle(document.querySelector('.cm-selectionBackground')).backgroundColor,aria:loader.getAttribute('aria-label'),dx:Math.abs((overlay.left+overlay.right)/2-(bounds.left+bounds.right)/2),dy:Math.abs((overlay.top+overlay.bottom)/2-(bounds.top+bounds.bottom)/2),animation:getComputedStyle(loader).animationName};
+    });
+    assert.ok(feedback.text.includes('🌿')&&feedback.text.includes('選ばれた line'),`${kind} marks the selected multi-line text`);
+    assert.notEqual(feedback.gray,'rgb(40, 40, 36)','Selected content is visibly gray');
+    assert.equal(feedback.selectionBackground,'rgba(0, 0, 0, 0)','Native selection highlighting is hidden');
+    assert.ok(feedback.dx<=1&&feedback.dy<=1,`Loader is centered on the selected text: ${JSON.stringify(feedback)}`);
+    assert.equal(feedback.aria,'Working…');assert.equal(feedback.animation,'still-ai-surface-pulse');
+    await page.evaluate(()=>window.stillEditor.setAIState({busy:true,label:'Processing'}));
+    assert.equal(await page.locator('#toolbar').isVisible(),false,'The toolbar stays closed for the whole busy state');
+    assert.equal(await page.locator('.still-ai-loader').getAttribute('aria-label'),'Processing');
+    if(kind==='wiki') {
+      await page.evaluate(()=>window.stillEditor.setAIState({busy:false}));
+      assert.equal(await page.locator('.still-ai-loader').isVisible(),false,'Errors and empty results clear loader feedback');
+      assert.equal(await page.locator('.still-ai-pending-text').count(),0);
+    } else {
+      const replacement='Optimiert 🪴';
+      assert.equal(await page.evaluate(payload=>window.stillEditor.replaceSelection(payload),{id,from,to,original,replacement}),true);
+      assert.equal(await source(),markdown.replace(original,replacement));
+      await page.evaluate(()=>window.stillEditor.setAIState({busy:false}));
+      const caret=await page.locator('.cm-content').evaluate(content=>{const range=content.cmTile.root.view.state.selection.main;return{from:range.from,to:range.to};});
+      assert.deepEqual(caret,{from:from+replacement.length,to:from+replacement.length},'Optimize collapses the selection at the replacement end');
+      assert.equal(await page.evaluate(()=>window.stillEditor.undo()),true);assert.equal(await source(),markdown,'Undo restores the original text');
+    }
+  }
+});
+test('pending feedback tracks safe edits, clears unsafe ranges, document switches and reduced motion',async()=>{
+  const markdown='Before selected text after',from=markdown.indexOf('selected'),to=from+'selected text'.length;
+  await load(markdown,'pending-doc');await select(from,to);await page.locator('[data-action=wiki]').click();
+  await page.waitForFunction(()=>{const loader=document.querySelector('.still-ai-loader');return loader&&!loader.hidden;});
+  await page.locator('.cm-content').evaluate(content=>content.cmTile.root.view.dispatch({changes:{from:0,insert:'X'}}));
+  assert.ok(await page.locator('.still-ai-pending-text').count()>0,'An edit before the range maps the feedback with CodeMirror changes');
+  await page.locator('.cm-content').evaluate((content,position)=>content.cmTile.root.view.dispatch({changes:{from:position+2,insert:'!'}}),from+1);
+  assert.equal(await page.locator('.still-ai-pending-text').count(),0,'An edit inside the selected source clears unsafe feedback');
+  assert.equal(await page.locator('.still-ai-loader').isVisible(),false);
+  await page.evaluate(()=>window.stillEditor.setAIState({busy:false}));
+
+  await load('Other selected text','switch-source');await select(0,5);await page.locator('[data-action=optimize]').click();
+  await page.waitForFunction(()=>{const loader=document.querySelector('.still-ai-loader');return loader&&!loader.hidden;});
+  await page.evaluate(()=>window.stillEditor.setDocument({id:'switch-target',markdown:'New document'}));
+  assert.equal(await page.locator('.still-ai-loader').isVisible(),false,'Switching documents destroys the previous loader');
+  assert.equal(await page.locator('.still-ai-pending-text').count(),0);
+  await page.evaluate(()=>window.stillEditor.setAIState({busy:true,label:'Other work'}));
+  await select(0,3);
+  assert.equal(await page.locator('.still-ai-loader').isVisible(),false,'Global busy without a request snapshot does not cover another selection');
+  await page.evaluate(()=>window.stillEditor.setAIState({busy:false}));
+
+  await load('Reduced selection','reduced-ai');await page.evaluate(()=>window.stillEditor.setAppearance({theme:'light',reduceMotion:true}));
+  await select(0,7);await page.locator('[data-action=wiki]').click();
+  await page.waitForFunction(()=>{const loader=document.querySelector('.still-ai-loader');return loader&&!loader.hidden;});
+  const motion=await page.evaluate(()=>['.still-ai-loader','.still-ai-loader-orbit','.still-ai-loader-core'].map(selector=>getComputedStyle(document.querySelector(selector)).animationName));
+  assert.deepEqual(motion,['none','none','none'],'Reduced motion keeps a static accessible loader');
+  await page.evaluate(()=>{window.stillEditor.setAIState({busy:false});window.stillEditor.setAppearance({theme:'light',reduceMotion:false});});
+});
+test('AI tint overrides nested Markdown colors and applies opacity only once',async()=>{
+  const markdown='**Bold** [Link](https://example.com) and [[Wiki]] and `code`';
+  await load(markdown,'ai-tint-doc');await select(0,markdown.length);await page.locator('[data-action=optimize]').click();
+  await page.waitForFunction(()=>{const loader=document.querySelector('.still-ai-loader');return loader&&!loader.hidden;});
+  const styles=await page.evaluate(()=>{
+    const marker=document.querySelector('.still-ai-pending-text'),color=getComputedStyle(marker).color;
+    const selectors=['.md-bold','.md-link','.md-wikilink-source','.md-code'];
+    return {color,opacity:getComputedStyle(marker).opacity,children:selectors.map(selector=>{const element=marker.querySelector(selector);return {selector,color:element&&getComputedStyle(element).color,opacity:element&&getComputedStyle(element).opacity};})};
+  });
+  assert.equal(styles.opacity,'0.58');
+  for(const child of styles.children){assert.ok(child.color,`${child.selector} is included in the pending selection`);assert.equal(child.color,styles.color,`${child.selector} is gray`);assert.equal(child.opacity,'1',`${child.selector} does not multiply wrapper opacity`);}
+  await page.evaluate(()=>window.stillEditor.setAIState({busy:false}));
+});
+test('AI loader repositions with the selected text after scrolling and resizing',async()=>{
+  const markdown=Array.from({length:45},(_,index)=>`Line ${index} ${'wide text '.repeat(8)}`).join('\n');
+  await load(markdown,'loader-geometry');const from=0,to=markdown.indexOf('\n');await select(from,to);await page.locator('[data-action=optimize]').click();
+  await page.waitForFunction(()=>{const loader=document.querySelector('.still-ai-loader');return loader&&!loader.hidden;});
+  const geometry=()=>page.evaluate(()=>{
+    const view=document.querySelector('.cm-content').cmTile.root.view,loader=document.querySelector('.still-ai-loader');
+    if(loader.hidden)return{visible:false};
+    const selection=view.state.selection.main,start=view.domAtPos(selection.from,1),end=view.domAtPos(selection.to,-1),range=document.createRange();range.setStart(start.node,start.offset);range.setEnd(end.node,end.offset);
+    const rects=[...range.getClientRects()].filter(rect=>rect.width||rect.height),left=Math.min(...rects.map(rect=>rect.left)),right=Math.max(...rects.map(rect=>rect.right)),top=Math.min(...rects.map(rect=>rect.top)),bottom=Math.max(...rects.map(rect=>rect.bottom)),overlay=loader.getBoundingClientRect();
+    return{visible:true,dx:Math.abs((overlay.left+overlay.right)/2-(left+right)/2),dy:Math.abs((overlay.top+overlay.bottom)/2-(top+bottom)/2)};
+  });
+  let positioned=await geometry();assert.ok(positioned.visible&&positioned.dx<=1&&positioned.dy<=1);
+  await page.locator('.cm-scroller').evaluate(element=>{element.scrollTop=element.scrollHeight;element.dispatchEvent(new Event('scroll'));});
+  await page.waitForFunction(()=>document.querySelector('.still-ai-loader').hidden,'', {timeout:2000});
+  await page.locator('.cm-scroller').evaluate(element=>{element.scrollTop=0;element.dispatchEvent(new Event('scroll'));});
+  await page.waitForFunction(()=>!document.querySelector('.still-ai-loader').hidden);
+  positioned=await geometry();assert.ok(positioned.visible&&positioned.dx<=1&&positioned.dy<=1,'Scrolling back restores the loader at the selection');
+  await page.setViewportSize({width:390,height:700});await page.waitForTimeout(80);
+  positioned=await geometry();assert.ok(positioned.visible&&positioned.dx<=1&&positioned.dy<=1,'Wrapping after resize keeps the loader centered on the text');
+  await page.evaluate(()=>window.stillEditor.setAIState({busy:false}));await page.setViewportSize({width:1000,height:900});
 });
 test('heading, quote and link actions are source edits',async()=>{
   await load('Some text\nOther line');await select(0,9);
@@ -257,7 +366,7 @@ test('wiki parsing excludes escaped, code, image-alt and HTML-comment tokens',as
   assert.equal(await source(),markdown);
 });
 test('Markdown links and GFM autolinks open only allowed web and mail URLs',async()=>{
-  await load('[Site](https://example.com/path) and [Mail](mailto:hello@example.com) and [Unsafe](javascript:alert(1)) and <https://auto.example> and https://bare.example/path.','doc-1');
+  await load('[Site](https://example.com/path) and [Mail](mailto:hello@example.com) and [Unsafe](javascript:alert(1)) and <https://auto.example> and https://bare.example/path and `https://code.example [Code](https://code-link.example)`','doc-1');
   await page.locator('.cm-content').evaluate(content=>content.blur());
   const links=page.locator('.md-link[role=link]');
   assert.equal(await links.count(),4);
@@ -275,6 +384,10 @@ test('Markdown links and GFM autolinks open only allowed web and mail URLs',asyn
   message=await page.evaluate(()=>window.messages.filter(item=>item.type==='openExternalLink').at(-1));assert.equal(message.url,'https://bare.example/path');
   await page.locator('.md-link').filter({hasText:'Unsafe'}).click({modifiers:['Meta']});
   assert.equal((await page.evaluate(()=>window.messages.filter(item=>item.type==='openExternalLink').length)),4,'Unsafe URL schemes never reach native navigation');
+  const codePosition=(await source()).indexOf('https://code.example');
+  const codePoint=await page.locator('.cm-content').evaluate((content,position)=>{const rect=content.cmTile.root.view.coordsAtPos(position);return{x:rect.left+2,y:(rect.top+rect.bottom)/2};},codePosition);
+  await page.mouse.click(codePoint.x,codePoint.y,{modifiers:['Meta']});
+  assert.equal((await page.evaluate(()=>window.messages.filter(item=>item.type==='openExternalLink').length)),4,'Inline-code URLs and Markdown remain inert');
 });
 test('wiki resolution folds case and accents, preserves path separators and rejects malformed escapes',async()=>{
   const markdown='[[cafe]] · [[WIKI/PLANTS/cafe]] · [[wiki//Plants/Café]] · [[wiki\\Plants\\Café]] · [[bad%]] · [[A/B [Fern]|x]] · [[wiki/A%2FB]] · [[wiki/A/B]]';
@@ -338,6 +451,19 @@ test('native undo and redo APIs restore focus and preserve exact replacements',a
   assert.deepEqual(await page.evaluate(()=>window.stillEditor.historyState()),{canUndo:false,canRedo:false});
   assert.equal(await page.evaluate(()=>window.stillEditor.undo()),false);
 });
+test('AI replacement scrolls a long result cursor into the editor viewport',async()=>{
+  await load('Short selection\n\n'+Array.from({length:32},(_,index)=>`Existing paragraph ${index}`).join('\n'),'long-ai-replacement');
+  const original='Short selection',replacement=Array.from({length:56},(_,index)=>`Optimized paragraph ${index} with enough text to wrap comfortably`).join('\n');
+  const replaced=await page.evaluate(payload=>window.stillEditor.replaceSelection(payload),{id:'long-ai-replacement',from:0,to:original.length,original,replacement});
+  assert.equal(replaced,true);assert.equal(await source(),replacement+'\n\n'+Array.from({length:32},(_,index)=>`Existing paragraph ${index}`).join('\n'));
+  const cursor=await page.locator('.cm-content').evaluate(content=>{
+    const view=content.cmTile.root.view,position=view.state.selection.main.head,rect=view.coordsAtPos(position),viewport=view.scrollDOM.getBoundingClientRect();
+    return {position,from:view.state.selection.main.from,to:view.state.selection.main.to,top:rect?.top,bottom:rect?.bottom,viewportTop:viewport.top,viewportBottom:viewport.bottom,scrollTop:view.scrollDOM.scrollTop};
+  });
+  assert.deepEqual({from:cursor.from,to:cursor.to},{from:replacement.length,to:replacement.length},'The replacement leaves a collapsed caret at its end');
+  assert.ok(cursor.scrollTop>0,'A long replacement scrolls the editor');
+  assert.ok(cursor.top>=cursor.viewportTop&&cursor.bottom<=cursor.viewportBottom,`The new caret remains visible: ${JSON.stringify(cursor)}`);
+});
 test('same document availability refresh preserves selection, undo and toolbar DOM',async()=>{
   await load('Keep selection', 'availability-doc',false);await select(0,4);
   await page.locator('[data-action=bold]').click();
@@ -386,7 +512,170 @@ test('Cmd+B requests the sidebar and leaves source, selection and history unchan
   assert.deepEqual(await page.evaluate(()=>window.stillEditor.historyState()),{canUndo:false,canRedo:false});
   await page.locator('[data-action=bold]').click();assert.equal(await source(),'**Selected** text');
 });
-test('caret motion is visual only, short, and snaps for navigation, lines, selection and IME',async()=>{
+test('repeated typing keeps source immediate across same-line selection moves and undo',async()=>{
+  const markdown='**bold** and *italic* stay editable\n\n## Heading remains source while active';
+  await load(markdown,'typing-selection-doc');await select(3);
+  assert.ok((await page.locator('.cm-content').textContent()).includes('**bold**'));
+  await page.locator('.cm-content').evaluate(content=>content.blur());await page.waitForTimeout(30);
+  assert.ok(!(await page.locator('.cm-content').textContent()).includes('**bold**'),'Blur returns the active line to styled preview');
+  await page.locator('.cm-content').evaluate(content=>content.focus());await page.waitForTimeout(30);
+  assert.ok((await page.locator('.cm-content').textContent()).includes('**bold**'),'Focus restores source on the active line');
+  for(const position of [5,10,15,20])await select(position);
+  assert.equal(await source(),markdown);
+  assert.ok((await page.locator('.cm-content').textContent()).includes('**bold**'),'Moving inside the active line keeps Markdown source visible');
+  await select(markdown.indexOf('## Heading'));
+  const moved=await page.locator('.cm-content').textContent();
+  assert.ok(moved.includes('## Heading'),'The newly active line shows its Markdown source');
+  assert.ok(!moved.includes('**bold**'),'The previous line returns to styled preview');
+  await select(3);await page.keyboard.type('word');
+  assert.equal(await source(),'**bwordold** and *italic* stay editable\n\n## Heading remains source while active','Typed text reaches Markdown immediately');
+  await page.keyboard.press('Meta+z');assert.equal(await source(),markdown,'Undo restores the exact Markdown source');
+  await page.keyboard.press('Meta+Shift+z');assert.equal(await source(),'**bwordold** and *italic* stay editable\n\n## Heading remains source while active','Redo restores the typed source');
+});
+test('typed glyphs reveal after a brief delay while the caret keeps trailing',async()=>{
+  await load('Caret','typing-reveal');await select(5);
+  await page.locator('.cm-content').evaluate(content=>{
+    const view=content.cmTile.root.view,delays=[0,16,40,80,130,220];
+    window.typingRevealProbe={startedAt:null,frames:[],snapshots:[]};
+    content.addEventListener('beforeinput',()=>{
+      if(window.typingRevealProbe.startedAt!==null)return;
+      window.typingRevealProbe.startedAt=performance.now();
+      const sample=()=>{
+        const glyph=document.querySelector('.still-typed-glyph[data-still-reveal-id]'),plugin=view.plugins.map(item=>item.value).find(value=>value?.overlay),overlay=plugin.overlay,target=view.coordsAtPos(view.state.selection.main.head),visual=overlay.hidden?document.querySelector('.cm-cursor-primary')?.getBoundingClientRect():overlay.getBoundingClientRect(),style=glyph?getComputedStyle(glyph):null;
+        return {at:performance.now()-window.typingRevealProbe.startedAt,source:window.stillEditor.getMarkdown(),text:content.textContent,glyphPresent:!!glyph,opacity:glyph?Number.parseFloat(style.opacity):1,stage:glyph?.className||null,sameNode:glyph===window.typingRevealProbe.originalGlyph,animation:style?{name:style.animationName,delay:style.animationDelay}:null,moving:!overlay.hidden,left:visual?.left??null,targetLeft:target?.left??null};
+      };
+      for(const delay of delays)setTimeout(()=>window.typingRevealProbe.snapshots.push({...sample(),delay}),delay);
+      const frame=()=>{const result=sample();window.typingRevealProbe.frames.push(result);if(result.at<230)requestAnimationFrame(frame);};requestAnimationFrame(frame);
+    },{once:true});
+  });
+  await page.keyboard.type('x');
+  await page.locator('.still-typed-glyph').evaluate(element=>{window.typingRevealProbe.originalGlyph=element;});
+  assert.equal(await source(),'Caretx','The source and native editor update in the input transaction');
+  assert.ok((await page.locator('.cm-content').textContent()).includes('Caretx'),'The new glyph is in CodeMirror immediately, even during its visual reveal');
+  await page.waitForFunction(()=>window.typingRevealProbe.snapshots.length===6&&window.typingRevealProbe.frames.at(-1)?.at>=220);
+  const probe=await page.evaluate(()=>window.typingRevealProbe);
+  await writeFile(`/tmp/still-typing-visual-probe-${browserName}.json`,JSON.stringify({browser:browser.version(),snapshots:probe.snapshots,frames:probe.frames},null,2)+'\n');
+  const frameFor=delay=>probe.snapshots.find(frame=>frame.delay===delay);
+  assert.equal(frameFor(0).opacity,0,'The glyph begins fully transparent');
+  assert.equal(frameFor(16).opacity,0,'The glyph stays hidden through the short delay');
+  assert.ok(probe.frames.filter(frame=>frame.at<26).every(frame=>frame.opacity===0),'No frame reveals the glyph during its initial delay');
+  assert.ok(probe.frames.some(frame=>frame.at>=32&&frame.at<90&&frame.opacity>0&&frame.opacity<1),'Captured frames show the brief opacity fade');
+  assert.ok(frameFor(80).glyphPresent,'The delayed mark remains during its bounded fade');
+  assert.equal(frameFor(130).glyphPresent,false,'The transient mark is removed after reveal');
+  assert.equal(frameFor(220).glyphPresent,false);
+  assert.equal(frameFor(130).moving,true,'Removing reveal marks does not snap the caret animation');
+  assert.ok(Math.abs(frameFor(130).left-frameFor(130).targetLeft)>.3,'The caret still trails the native target during reveal cleanup');
+  assert.equal(frameFor(220).moving,false,'The caret settles at its target');
+  assert.ok(Math.abs(frameFor(220).left-frameFor(220).targetLeft)<1);
+  await page.waitForTimeout(30);
+  assert.equal(await page.evaluate(()=>window.stillEditor.undo()),true);
+  assert.equal(await source(),'Caret','Reveal cleanup does not create an undo event');
+});
+test('nearby typing keeps each glyph reveal time through Markdown redecorations',async()=>{
+  await load('*a','typing-reveal-burst');await select(2);
+  await page.locator('.cm-content').evaluate(content=>{
+    const view=content.cmTile.root.view;
+    const insert=text=>{const head=view.state.selection.main.head;view.dispatch({changes:{from:head,insert:text},selection:{anchor:head+text.length},userEvent:'input.type'});};
+    window.typingBurstProbe={startedAt:performance.now(),frames:[],before:null,ready:false};insert('b');
+    const snapshot=()=>[...document.querySelectorAll('.still-typed-glyph')].map(glyph=>({id:Number(glyph.dataset.stillRevealId),text:glyph.textContent,stage:glyph.classList.contains('still-typed-glyph--waiting')?'waiting':'revealing',opacity:Number.parseFloat(getComputedStyle(glyph).opacity)}));
+    const waitForPartial=()=>{
+      const older=snapshot()[0],elapsed=performance.now()-window.typingBurstProbe.startedAt;
+      if(older?.stage==='revealing'&&older.opacity>0&&older.opacity<1) {
+        window.typingBurstProbe.before={...older,at:elapsed};window.typingBurstProbe.secondAt=elapsed;insert('*');
+        requestAnimationFrame(()=>{window.typingBurstProbe.sampleAt=performance.now()-window.typingBurstProbe.startedAt;window.typingBurstProbe.frames=snapshot();window.typingBurstProbe.ready=true;});
+      } else if(elapsed<100)requestAnimationFrame(waitForPartial);
+      else {window.typingBurstProbe.sampleAt=elapsed;window.typingBurstProbe.frames=snapshot();window.typingBurstProbe.ready=true;}
+    };
+    requestAnimationFrame(waitForPartial);
+  });
+  await page.waitForFunction(()=>window.stillEditor.getMarkdown()==='*ab*');
+  assert.equal(await source(),'*ab*','Both keystrokes reach source without a queued input layer');
+  await page.waitForFunction(()=>window.typingBurstProbe.ready);
+  const burstProbe=await page.evaluate(()=>window.typingBurstProbe);await writeFile(`/tmp/still-typing-burst-${browserName}.json`,JSON.stringify(burstProbe,null,2)+'\n');const [older,newer]=burstProbe.frames;
+  assert.ok(burstProbe.sampleAt>burstProbe.secondAt&&burstProbe.sampleAt-burstProbe.secondAt<30,'The burst sample uses the next rendered frame before the second insertion delay expires');
+  assert.ok(burstProbe.before.opacity>0&&burstProbe.before.opacity<1,'The second insertion follows a genuinely partial first reveal');
+  assert.ok(older.id<newer.id,'Each inserted run retains an independent reveal identity');
+  assert.equal(older.text,'b');assert.equal(older.stage,'revealing');assert.ok(older.opacity>=burstProbe.before.opacity,'The older glyph does not restart or regress after Markdown redecorations');
+  assert.equal(newer.text,'*');assert.equal(newer.stage,'waiting');assert.equal(newer.opacity,0,'The newer glyph keeps its own full delay');
+  await page.waitForTimeout(90);
+  assert.equal(await page.locator('.still-typed-glyph').count(),0,'Both runs reveal and clean up within a bounded interval');
+  assert.equal(await page.evaluate(()=>window.stillEditor.undo()),true);assert.equal(await source(),'*a');
+});
+test('Unicode glyph ranges stay whole and non-typing edits reveal immediately',async()=>{
+  await load('Café ','unicode-reveal');await select(5);
+  await page.locator('.cm-content').evaluate(content=>{
+    const view=content.cmTile.root.view,head=view.state.selection.main.head;
+    view.dispatch({changes:{from:head,insert:'🪴'},selection:{anchor:head+2},userEvent:'input.type'});
+  });
+  assert.equal(await source(),'Café 🪴','A supplementary Unicode glyph reaches source in one transaction');
+  const unicode=await page.locator('.still-typed-glyph').evaluate(element=>({text:element.textContent,length:element.textContent.length,selection:element.closest('.cm-content').cmTile.root.view.state.selection.main.head}));
+  assert.deepEqual(unicode,{text:'🪴',length:2,selection:7},'The reveal decoration covers the complete UTF-16 insertion range');
+  await page.keyboard.press('Meta+z');assert.equal(await source(),'Café ','Undo removes the complete glyph');assert.equal(await page.locator('.still-typed-glyph').count(),0);
+
+  await load('Text','reveal-cancel');await select(4);await page.keyboard.type('x');
+  assert.equal(await page.locator('.still-typed-glyph').count(),1);
+  await page.keyboard.press('Backspace');assert.equal(await source(),'Text');assert.equal(await page.locator('.still-typed-glyph').count(),0,'Deletion cancels pending reveal immediately');
+  await page.keyboard.type('x');await page.keyboard.press('ArrowLeft');
+  assert.equal(await source(),'Textx');assert.equal(await page.locator('.still-typed-glyph').count(),0,'Navigation reveals pending text immediately');
+  await page.keyboard.press('ArrowRight');await page.keyboard.type('y');
+  await page.locator('.cm-content').evaluate(content=>content.blur());
+  assert.equal(await source(),'Textxy');assert.equal(await page.locator('.still-typed-glyph').count(),0,'Blur leaves no hidden text');
+
+  await page.evaluate(()=>window.stillEditor.focus());await page.keyboard.press('End');await page.keyboard.type('z');
+  assert.equal(await page.locator('.still-typed-glyph').count(),1);
+  await page.evaluate(()=>window.dispatchEvent(new Event('blur')));
+  assert.equal(await source(),'Textxyz');assert.equal(await page.locator('.still-typed-glyph').count(),0,'Window blur also clears the pending visual delay');
+
+  await load('Before','reveal-switch');await select(6);await page.keyboard.type('x');
+  await page.evaluate(()=>window.stillEditor.setDocument({id:'reveal-replacement',markdown:'Replacement'}));
+  assert.equal(await source(),'Replacement');assert.equal(await page.locator('.still-typed-glyph').count(),0,'Document replacement drops stale reveal ranges');
+
+  await select(11);await page.keyboard.type('x');assert.equal(await page.locator('.still-typed-glyph').count(),1);
+  await page.evaluate(()=>window.stillEditor.setAppearance({theme:'light',reduceMotion:true}));
+  assert.equal(await source(),'Replacementx');assert.equal(await page.locator('.still-typed-glyph').count(),0,'Enabling reduced motion reveals text that is already pending');
+  await page.keyboard.type('y');assert.equal(await source(),'Replacementxy');assert.equal(await page.locator('.still-typed-glyph').count(),0,'Reduced motion makes new text visible immediately');
+  await page.evaluate(()=>window.stillEditor.setAppearance({theme:'light',reduceMotion:false}));
+  await page.locator('.cm-content').evaluate(content=>{
+    const view=content.cmTile.root.view,head=view.state.selection.main.head;
+    view.dispatch({changes:{from:head,insert:' pasted'},selection:{anchor:head+7},userEvent:'input.paste'});
+  });
+  assert.equal(await source(),'Replacementxy pasted');assert.equal(await page.locator('.still-typed-glyph').count(),0,'Pasted text is never delayed');
+  await load('Composition','reveal-ime');await select(11);
+  await page.locator('.cm-content').dispatchEvent('compositionstart',{data:''});
+  await page.locator('.cm-content').evaluate(content=>{const view=content.cmTile.root.view,head=view.state.selection.main.head;view.dispatch({changes:{from:head,insert:'あ'},selection:{anchor:head+1},userEvent:'input.type.compose'});});
+  assert.equal(await source(),'Compositionあ');assert.equal(await page.locator('.still-typed-glyph').count(),0,'IME composition commits remain immediately visible');
+  await page.locator('.cm-content').dispatchEvent('compositionend',{data:'あ'});
+});
+test('caret follow remains soft and similarly slow after first, paused, steady and rapid input',async()=>{
+  await load('Caret','caret-cadence');await select(5);
+  await page.locator('.still-smooth-caret').evaluate(element=>{
+    const animate=element.animate.bind(element);window.caretDurations=[];
+    element.animate=(frames,timing)=>{window.caretDurations.push(timing.duration);return animate(frames,timing);};
+  });
+  const typeAndMeasure=async(pauseMs)=>{
+    if(pauseMs)await page.waitForTimeout(pauseMs);
+    const previous=await page.evaluate(()=>window.caretDurations.length);
+    await page.locator('.cm-content').evaluate(content=>{
+      const view=content.cmTile.root.view,head=view.state.selection.main.head;
+      view.dispatch({changes:{from:head,insert:'x'},selection:{anchor:head+1},userEvent:'input.type'});
+    });
+    await page.waitForFunction(count=>window.caretDurations.length>count,previous);
+    return page.evaluate(()=>({duration:window.caretDurations.at(-1),source:window.stillEditor.getMarkdown()}));
+  };
+  let sample=await typeAndMeasure(0);
+  assert.ok(sample.duration>=170&&sample.duration<=200,'The first character gets a soft, longer follow');
+  assert.equal(sample.source,'Caretx');
+  sample=await typeAndMeasure(130);
+  const pausedDuration=sample.duration;
+  assert.ok(sample.duration>=170&&sample.duration<=200,'A pause remains inside the soft follow range');
+  sample=await typeAndMeasure(70);
+  assert.ok(sample.duration>=170&&sample.duration<=200,'Steady input is not shortened');
+  sample=await typeAndMeasure(20);
+  assert.ok(sample.duration>=170&&sample.duration<=200,'Rapid input keeps the longer follow instead of snapping shorter');
+  assert.ok(Math.abs(sample.duration-pausedDuration)<=10,'Rapid typing retargets the current visual position with a similarly soft duration');
+  assert.equal(sample.source,'Caretxxxx','Every keystroke updates the native source immediately');
+});
+test('caret motion is visual only, slow, and snaps for navigation, lines, selection and IME',async()=>{
   await load('Typing','caret-doc');await select(6);await page.waitForTimeout(80);
   const inspect=()=>page.evaluate(()=>{
     const content=document.querySelector('.cm-content'),editor=content.cmTile.root.view,overlay=document.querySelector('.still-smooth-caret');
@@ -396,8 +685,8 @@ test('caret motion is visual only, short, and snaps for navigation, lines, selec
   assert.equal(await source(),'Typing!'); // source is immediate, before any visual settle.
   await page.waitForFunction(()=>document.querySelector('.still-smooth-caret').getAnimations().length>0);
   let state=await inspect();assert.equal(state.head,7);assert.equal(state.moving,true);assert.equal(state.visible,true);
-  assert.equal(state.animations[0].duration,115);assert.equal(state.animations[0].easing,'cubic-bezier(0.22, 0.61, 0.36, 1)');
-  await page.waitForTimeout(150);state=await inspect();assert.equal(state.visible,false);assert.equal(state.moving,false);assert.ok(['visible','hidden'].includes(state.nativeCursor));
+  assert.ok(state.animations[0].duration>=170&&state.animations[0].duration<=200,'Caret motion stays within the slower follow range');assert.equal(state.animations[0].easing,'cubic-bezier(0.22, 0.61, 0.36, 1)');
+  await page.waitForTimeout(230);state=await inspect();assert.equal(state.visible,false);assert.equal(state.moving,false);assert.ok(['visible','hidden'].includes(state.nativeCursor));
   await page.keyboard.press('Backspace');await page.waitForFunction(()=>document.querySelector('.still-smooth-caret').getAnimations().length>0);
   assert.equal(await source(),'Typing');
   await page.keyboard.press('ArrowLeft');state=await inspect();assert.equal(state.moving,false);assert.equal(state.visible,false);assert.equal(state.head,5);
