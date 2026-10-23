@@ -4,14 +4,16 @@ import { history, historyKeymap, defaultKeymap, indentWithTab, isolateHistory, u
 import { markdown, markdownKeymap } from '@codemirror/lang-markdown';
 import { syntaxTree } from '@codemirror/language';
 import { GFM } from '@lezer/markdown';
+import { acceptCompletion, autocompletion, closeCompletion, startCompletion } from '@codemirror/autocomplete';
 
 const root = document.getElementById('editor');
 const toolbar = document.getElementById('toolbar');
 let documentId = null, strings = {}, aiAvailable = false, aiBusy = false, aiLabel = null;
+let activeLinkMetadata={id:null,documents:[]}, pendingLinkMetadata=null;
 const localizedExtension = new Compartment();
 let stableSelection = null, suppressedSelection = null, toolbarFrame = 0;
 const pendingImages = new Map();
-const fallback = {bold:'Bold', italic:'Italic', strikethrough:'Strikethrough', heading1:'Heading 1', heading2:'Heading 2', quote:'Quote', code:'Code', link:'Link', wikiAction:'Wiki', optimizeAction:'Optimize', editSource:'Edit source', importImage:'Import image', selectionToolbar:'Text formatting', busy:'Working…', imageAlt:'Image', table:'Table'};
+const fallback = {bold:'Bold', italic:'Italic', strikethrough:'Strikethrough', heading1:'Heading 1', heading2:'Heading 2', quote:'Quote', code:'Code', link:'Link', wikiAction:'Wiki', optimizeAction:'Optimize', editSource:'Edit source', importImage:'Import image', selectionToolbar:'Text formatting', busy:'Working…', imageAlt:'Image', table:'Table', linkOpenNote:'Notiz öffnen', linkOpenWiki:'Wiki-Seite öffnen', linkCreateMissing:'Nicht gefunden – mit ⌘-Klick erstellen', linkAmbiguous:'Mehrdeutiger Link', linkExternal:'Externen Link öffnen', linkSectionNotes:'Notizen', linkSectionWiki:'Wiki'};
 const tr = key => strings['editor.' + key] || fallback[key] || key;
 const post = message => window.webkit?.messageHandlers?.still?.postMessage(message);
 // Only a short visual caret overlay moves. CodeMirror selection, input and its
@@ -100,6 +102,14 @@ motionPreference.addEventListener('change',()=>{caretMotion?.snap();if(reducedMo
 
 const foldEffect = StateEffect.define();
 const focusEffect = StateEffect.define();
+const linkMetadataEffect = StateEffect.define();
+const linkMetadataField = StateField.define({
+  create:()=>activeLinkMetadata.id===documentId?activeLinkMetadata:{id:documentId,documents:[]},
+  update(value,transaction) {
+    for(const effect of transaction.effects)if(effect.is(linkMetadataEffect))value=effect.value;
+    return value;
+  }
+});
 const focusField = StateField.define({
   create:()=>false,
   update(value,transaction) {
@@ -203,11 +213,223 @@ class DetailsWidget extends WidgetType {
   ignoreEvent() { return true; }
 }
 function tableCells(line) { return line.trim().replace(/^\|/,'').replace(/\|$/,'').split(/(?<!\\)\|/).map(cell=>cell.replace(/\\\|/g,'|')); }
+function sanitizeLinkDocuments(documents) {
+  return (Array.isArray(documents)?documents:[]).filter(item=>item&&typeof item.id==='string'&&typeof item.title==='string'&&['notes','wiki'].includes(item.section)&&typeof item.target==='string')
+    .map(item=>({id:item.id,title:item.title,section:item.section,folders:Array.isArray(item.folders)?item.folders.filter(folder=>typeof folder==='string'):[],target:item.target}));
+}
+function normalizeTarget(target) { return String(target??''); }
+function foldText(value) { return String(value??'').normalize('NFD').replace(/\p{Diacritic}/gu,'').toLocaleLowerCase('en-US'); }
+function hasInvalidEscape(value) { return /%(?![\da-f]{2})/i.test(value); }
+function decodeTargetComponents(value) {
+  if(hasInvalidEscape(value))return null;
+  try{return String(value).split('/').map(component=>decodeURIComponent(component));}catch{return null;}
+}
+function decodeOnce(value) { const components=decodeTargetComponents(value);return components?.length===1?components[0]:null; }
+function targetKey(value) { const components=decodeTargetComponents(value);return components?JSON.stringify(components.map(foldText)):null; }
+function folderPathFor(document) {
+  if(document.folders?.length)return document.folders.join('/');
+  return normalizeTarget(document.target).split('/').slice(1,-1).join('/');
+}
+function resolveWikiTarget(target, metadata) {
+  const normalized=targetKey(normalizeTarget(target));
+  if(normalized===null)return {status:'missing',document:null};
+  const docs=metadata?.documents||[];
+  const exact=docs.filter(document=>targetKey(normalizeTarget(document.target))===normalized);
+  if(exact.length===1)return {status:'resolved',document:exact[0]};
+  if(exact.length>1)return {status:'ambiguous',document:null};
+  if(target.includes('/'))return {status:'missing',document:null};
+  const decoded=decodeOnce(target);
+  if(decoded===null)return {status:'missing',document:null};
+  const matches=docs.filter(document=>foldText(document.title)===foldText(target)||foldText(document.title)===foldText(decoded));
+  if(matches.length===1)return {status:'resolved',document:matches[0]};
+  if(!matches.length)return {status:'missing',document:null};
+  const source=docs.find(document=>document.id===metadata.id);
+  if(source) {
+    const folder=foldText(folderPathFor(source)),inFolder=matches.filter(document=>document.section===source.section&&foldText(folderPathFor(document))===folder);
+    if(inFolder.length===1)return {status:'resolved',document:inFolder[0]};
+    const inSection=matches.filter(document=>document.section===source.section);
+    if(inSection.length===1)return {status:'resolved',document:inSection[0]};
+  }
+  return {status:'ambiguous',document:null};
+}
+function codeAndImageRanges(state) {
+  const ranges=[];
+  let fence=null,fenceStart=0;
+  for(let number=1;number<=state.doc.lines;number++) {
+    const line=state.doc.line(number),marker=line.text.match(/^ {0,3}(`{3,}|~{3,})/);
+    if(fence) {
+      if(marker&&marker[1][0]===fence[0]&&marker[1].length>=fence.length){ranges.push([fenceStart,line.to]);fence=null;}
+    } else if(marker){fence=marker[1];fenceStart=line.from;}
+    else if(/^ {4,}\S|^\t\S/.test(line.text))ranges.push([line.from,line.to]);
+  }
+  if(fence)ranges.push([fenceStart,state.doc.length]);
+  syntaxTree(state).iterate({enter(node){
+    if(['FencedCode','CodeBlock','InlineCode','Image'].includes(node.name)) {ranges.push([node.from,node.to]);return false;}
+  }});
+  return ranges;
+}
+function escapedAt(source, position) {
+  let slashes=0;for(let index=position-1;index>=0&&source[index]==='\\';index--)slashes++;
+  return slashes%2===1;
+}
+function insideImageAlt(source, position) {
+  let opener=source.lastIndexOf('![',position);
+  while(opener>=0) {
+    if(!escapedAt(source,opener)) {
+      const closer=source.indexOf(']',opener+2);
+      if(closer<0||position<closer)return true;
+    }
+    opener=source.lastIndexOf('![',opener-1);
+  }
+  return false;
+}
+function insideHtmlComment(source, position) {
+  return source.lastIndexOf('<!--',position)>source.lastIndexOf('-->',position);
+}
+function wikiLinks(state) {
+  const source=state.doc.toString(), excluded=codeAndImageRanges(state), links=[];
+  const pattern=/\[\[([^\n]*?)\]\]/g;
+  let match;
+  while((match=pattern.exec(source))) {
+    const from=match.index,to=pattern.lastIndex;
+    if(escapedAt(source,from)||insideImageAlt(source,from)||insideHtmlComment(source,from)||excluded.some(([a,b])=>from>=a&&from<b))continue;
+    if(match[1].includes('[['))continue;
+    const separator=match[1].indexOf('|');
+    const rawTarget=(separator<0?match[1]:match[1].slice(0,separator)).trim();
+    if(!rawTarget)continue;
+    const alias=separator<0?'':match[1].slice(separator+1).trim();
+    links.push({from,to,original:match[0],target:rawTarget,alias});
+  }
+  return links;
+}
+function wikiCompletionContext(state, position=state.selection.main.head) {
+  if(!state.selection.main.empty)return null;
+  const line=state.doc.lineAt(position),before=state.doc.sliceString(line.from,position),match=/\[\[([^\]\n]*)$/.exec(before);
+  if(!match)return null;
+  if(state.doc.sliceString(position,line.to).includes(']]'))return null;
+  const from=line.from+match.index;
+  const source=state.doc.toString();
+  if(escapedAt(source,from)||insideImageAlt(source,from)||insideHtmlComment(source,from)||codeAndImageRanges(state).some(([a,b])=>from>=a&&from<b))return null;
+  if(match[1].includes('|'))return null;
+  return {from,to:position,query:match[1]};
+}
+function completionApplyFor(document, allDocuments) {
+  const sameTitle=allDocuments.filter(item=>foldText(item.title)===foldText(document.title)).length;
+  const simpleTitle=!['[',']','|','%','/','\\','\n','\r'].some(character=>document.title.includes(character));
+  const target=sameTitle===1&&simpleTitle?document.title:document.target;
+  return (editor,_completion,from,to)=>{
+    const insert=`[[${target}]]`;
+    editor.dispatch({changes:{from,to,insert},selection:{anchor:from+insert.length},annotations:Transaction.userEvent.of('input.complete'),scrollIntoView:true});
+    editor.focus();
+  };
+}
+function wikiCompletionSource(context) {
+  const candidate=wikiCompletionContext(context.state,context.pos);
+  if(!candidate)return null;
+  const metadata=context.state.field(linkMetadataField),documents=metadata?.documents||[];
+  if(!documents.length)return null;
+  const queryComponents=decodeTargetComponents(candidate.query);
+  const query=foldText(queryComponents?queryComponents.join('/'):candidate.query);
+  const filtered=documents.filter(document=>{
+    const searchable=foldText([document.title,document.target,document.section,...document.folders].join(' '));
+    return !query||searchable.includes(query);
+  }).sort((left,right)=>left.title.localeCompare(right.title)||left.target.localeCompare(right.target));
+  const options=filtered.slice(0,80).map(document=>{
+    const section=tr(document.section==='wiki'?'linkSectionWiki':'linkSectionNotes');
+    const folder=document.folders.join('/');
+    return {label:document.title,detail:[section,folder].filter(Boolean).join(' · '),type:document.section==='wiki'?'namespace':'text',apply:completionApplyFor(document,documents)};
+  });
+  return options.length?{from:candidate.from,to:candidate.to,options,filter:false,update:(_result,_from,_to,nextContext)=>wikiCompletionSource(nextContext)}:null;
+}
+function allowedExternalUrl(value) {
+  if(typeof value!=='string'||/[\u0000-\u001f\u007f]/.test(value))return null;
+  try {
+    const parsed=new URL(value.trim());
+    if(!['http:','https:','mailto:'].includes(parsed.protocol))return null;
+    if((parsed.protocol==='http:'||parsed.protocol==='https:')&&!parsed.hostname)return null;
+    if(parsed.protocol==='mailto:'&&!parsed.pathname)return null;
+    return parsed.href;
+  } catch { return null; }
+}
+function markdownLinks(state) {
+  const links=[];
+  syntaxTree(state).iterate({enter(node){
+    if(node.name==='Image'||node.name==='FencedCode'||node.name==='CodeBlock'||node.name==='InlineCode')return false;
+    if(node.name==='Link'||node.name==='Autolink') {
+      const url=node.node.getChild('URL');
+      if(url)links.push({from:node.from,to:node.to,url:state.doc.sliceString(url.from,url.to),kind:node.name});
+      return false;
+    }
+    if(node.name==='URL'&&!['Link','Autolink'].includes(node.node.parent?.name)) {
+      links.push({from:node.from,to:node.to,url:state.doc.sliceString(node.from,node.to),kind:'URL'});
+      return false;
+    }
+  }});
+  return links;
+}
+function linkAtPosition(state,position) {
+  const wiki=wikiLinks(state).find(link=>position>=link.from&&position<=link.to);
+  if(wiki)return {kind:'wiki',link:wiki};
+  const external=markdownLinks(state).find(link=>position>=link.from&&position<=link.to&&allowedExternalUrl(link.url));
+  return external?{kind:'external',link:external,url:allowedExternalUrl(external.url)}:null;
+}
+function activateWikiLink(link) {
+  if(documentId===null)return false;
+  post({type:'openWikiLink',id:documentId,target:link.target,from:link.from,to:link.to,original:link.original});
+  return true;
+}
+function activateExternalLink(url) {
+  const safe=allowedExternalUrl(url);
+  if(!safe||documentId===null)return false;
+  post({type:'openExternalLink',id:documentId,url:safe});
+  return true;
+}
+function activateAtPosition(position) {
+  const found=linkAtPosition(view.state,position);
+  if(!found)return false;
+  return found.kind==='wiki'?activateWikiLink(found.link):activateExternalLink(found.url);
+}
+function activateRenderedLink(element) {
+  if(!element||!element.dataset.stillLinkKind)return false;
+  const from=Number(element.dataset.stillLinkFrom),to=Number(element.dataset.stillLinkTo);
+  if(!Number.isInteger(from)||!Number.isInteger(to))return false;
+  if(element.dataset.stillLinkKind==='wiki') {
+    const link=wikiLinks(view.state).find(candidate=>candidate.from===from&&candidate.to===to);
+    return link?activateWikiLink(link):false;
+  }
+  const link=markdownLinks(view.state).find(candidate=>candidate.from===from&&candidate.to===to);
+  return link?activateExternalLink(link.url):false;
+}
+class WikiLinkWidget extends WidgetType {
+  constructor(link,resolution,id) { super();this.link=link;this.resolution=resolution;this.id=id; }
+  eq(other) { return this.link.from===other.link.from&&this.link.to===other.link.to&&this.link.original===other.link.original&&this.link.target===other.link.target&&this.link.alias===other.link.alias&&this.resolution.status===other.resolution.status&&this.resolution.document?.id===other.resolution.document?.id&&this.resolution.document?.title===other.resolution.document?.title&&this.resolution.document?.section===other.resolution.document?.section&&this.id===other.id; }
+  toDOM(editor) {
+    const element=document.createElement('span'),{link,resolution}=this;
+    const targetTitle=resolution.document?.title||decodeOnce(link.target.split('/').at(-1));
+    const label=link.alias||targetTitle;
+    element.className='md-wiki-link'+(resolution.status==='resolved'?' is-resolved':resolution.status==='ambiguous'?' is-ambiguous':' is-unresolved');
+    element.textContent=label;element.setAttribute('role','link');element.tabIndex=0;
+    element.dataset.stillLinkKind='wiki';element.dataset.stillLinkFrom=String(link.from);element.dataset.stillLinkTo=String(link.to);
+    const stateText=resolution.status==='resolved'?(resolution.document.section==='wiki'?tr('linkOpenWiki'):tr('linkOpenNote')):resolution.status==='ambiguous'?tr('linkAmbiguous'):tr('linkCreateMissing');
+    element.title=`${stateText}: ${label}`;element.setAttribute('aria-label',`${stateText}: ${label}`);
+    element.addEventListener('mousedown',event=>event.preventDefault());
+    element.addEventListener('click',event=>{
+      event.preventDefault();event.stopPropagation();
+      if(event.metaKey||event.ctrlKey)activateRenderedLink(element);
+      else editSource(editor,link.from);
+    });
+    element.addEventListener('keydown',event=>{
+      if(event.key==='Enter'){event.preventDefault();event.stopPropagation();activateRenderedLink(element);}
+    });
+    return element;
+  }
+  ignoreEvent() { return true; }
+}
 function decorationsFor(state) {
   const ranges=[], occupied=[];
   const add=(from,to,decoration)=> { if(to>=from) ranges.push(decoration.range(from,to)); };
   const replace=(from,to,widget,block=false)=>add(from,to,Decoration.replace({widget,block}));
-  const raw=state.doc.toString();
+  const raw=state.doc.toString(), wiki=wikiLinks(state), metadata=state.field(linkMetadataField);
   const codeLines=new Set(); const codeRanges=[]; let fence=null, fenceStart=0;
   for(let n=1;n<=state.doc.lines;n++) {
     const line=state.doc.line(n), marker=line.text.match(/^ {0,3}(`{3,}|~{3,})/);
@@ -259,12 +481,22 @@ function decorationsFor(state) {
     if(quote) { add(line.from,line.from,Decoration.line({class:'md-quote'})); if(!active) replace(line.from,line.from+quote[0].length); }
     if(/^\s*([-*_])(?:\s*\1){2,}\s*$/.test(text) && !active) { add(line.from,line.from,Decoration.line({class:'md-rule'})); replace(line.from,line.to); continue; }
   }
+  const wikiRanges=[];
+  for(const link of wiki) {
+    if(occupied.some(([from,to])=>link.from>=from&&link.to<=to))continue;
+    const active=intersectsSelectionLines(state,link.from,link.to), resolution=resolveWikiTarget(link.target,metadata);
+    wikiRanges.push([link.from,link.to]);occupied.push([link.from,link.to]);
+    if(active) {
+      add(link.from,link.to,Decoration.mark({class:'md-wikilink-source',attributes:{'data-still-link-kind':'wiki','data-still-link-from':String(link.from),'data-still-link-to':String(link.to)}}));
+    } else replace(link.from,link.to,new WikiLinkWidget(link,resolution,metadata.id));
+  }
   syntaxTree(state).iterate({enter(node) {
     const {from,to,name}=node;
     if(occupied.some(([a,b])=>from>=a&&to<=b))return false;
     if(name==='FencedCode'||name==='CodeBlock')return false;
+    if(name==='Link'&&wikiRanges.some(([a,b])=>from<b&&to>a))return false;
     const active=intersectsSelectionLines(state,from,to);
-    const classes={StrongEmphasis:'md-bold',Emphasis:'md-italic',Strikethrough:'md-strike',InlineCode:'md-code',Link:'md-link'};
+    const classes={StrongEmphasis:'md-bold',Emphasis:'md-italic',Strikethrough:'md-strike',InlineCode:'md-code'};
     if(classes[name])add(from,to,Decoration.mark({class:classes[name]}));
     if(name==='Image') {
       if(!active) {
@@ -275,11 +507,24 @@ function decorationsFor(state) {
       }
       return false;
     }
-    if(name==='Link') {
-      if(!active) {
+    const parentName=node.node.parent?.name;
+    const externalNode=name==='Link'||name==='Autolink'||name==='URL'&&!['Link','Autolink'].includes(parentName);
+    if(externalNode) {
+      const urlNode=name==='URL'?node.node:node.node.getChild('URL'),safeUrl=urlNode?allowedExternalUrl(state.doc.sliceString(urlNode.from,urlNode.to)):null;
+      const labelMatch=state.doc.sliceString(from,to).match(/^\[([^\]]*)\]/),label=(labelMatch?.[1]||state.doc.sliceString(from,to)).replace(/[*_~`<>]/g,'');
+      const attributes={'data-still-link-kind':'external','data-still-link-from':String(from),'data-still-link-to':String(to)};
+      if(safeUrl)attributes['data-still-link-url']=safeUrl;
+      if(safeUrl&&!active){attributes.role='link';attributes.tabindex='0';attributes['aria-label']=`${tr('linkExternal')}: ${label||safeUrl}`;}
+      add(from,to,Decoration.mark({class:'md-link',attributes}));
+      if(name==='Link'&&!active) {
         let close=node.node.firstChild;
         while(close && !(close.name==='LinkMark'&&state.doc.sliceString(close.from,close.to)===']'))close=close.nextSibling;
         if(close){replace(from,from+1);replace(close.from,to);}
+      }
+      if(name==='Autolink'&&!active&&safeUrl) {
+        const first=node.node.firstChild,last=node.node.lastChild;
+        if(first?.name==='LinkMark'&&state.doc.sliceString(first.from,first.to)==='<')replace(first.from,first.to);
+        if(last?.name==='LinkMark'&&state.doc.sliceString(last.from,last.to)==='>')replace(last.from,last.to);
       }
       // Descendant emphasis still needs its own styles; LinkMark and URL are handled above.
     }
@@ -295,7 +540,7 @@ function decorationsFor(state) {
 }
 const decorationField=StateField.define({
   create:decorationsFor,
-  update(value,transaction) { return transaction.docChanged || transaction.selection || transaction.effects.some(effect=>effect.is(foldEffect)||effect.is(focusEffect)) || syntaxTree(transaction.state)!==syntaxTree(transaction.startState) ? decorationsFor(transaction.state) : value; },
+  update(value,transaction) { return transaction.docChanged || transaction.selection || transaction.effects.some(effect=>effect.is(foldEffect)||effect.is(focusEffect)||effect.is(linkMetadataEffect)) || syntaxTree(transaction.state)!==syntaxTree(transaction.startState) ? decorationsFor(transaction.state) : value; },
   provide:field=>EditorView.decorations.from(field)
 });
 function selectedSnapshot() {
@@ -391,16 +636,25 @@ async function sendImage(file, position) {
   if(documentId===id && pendingImages.has(requestId))post({type:'importImage',id,requestId,filename:file.name || 'image.png',mime:file.type,base64});
 }
 const view=new EditorView({parent:root,state:createState('')});
+function scheduleWikiCompletion() {
+  if(!wikiCompletionContext(view.state))return;
+  const doc=view.state.doc,position=view.state.selection.main.head;
+  queueMicrotask(()=>{if(view.state.doc===doc&&view.state.selection.main.head===position&&wikiCompletionContext(view.state))startCompletion(view);});
+}
 function localizedExtensions() {
   return [placeholder(strings['editor.emptyBody']||'Start writing…'),EditorView.contentAttributes.of({'aria-label':strings['editor.emptyBody']||'Document',spellcheck:'true',autocapitalize:'sentences'})];
 }
 function createState(doc) {
   return EditorState.create({doc,extensions:[
-    history(),drawSelection(),caretMotionPlugin,markdown({extensions:[GFM]}),focusField,foldField,decorationField,
+    history(),drawSelection(),caretMotionPlugin,markdown({extensions:[GFM]}),focusField,foldField,linkMetadataField,decorationField,
     EditorView.lineWrapping,localizedExtension.of(localizedExtensions()),
+    autocompletion({override:[wikiCompletionSource],maxRenderedOptions:12,interactionDelay:0}),
     keymap.of([
+      {key:'Enter',run:()=>{const target=document.activeElement?.closest?.('[data-still-link-kind]');return target?activateRenderedLink(target):false;}},
+      {key:'Mod-Enter',run:()=>activateAtPosition(view.state.selection.main.head)},
       {key:'Mod-b',run:()=>{caretMotion?.snap();post({type:'toggleSidebar'});return true;}},{key:'Mod-i',run:()=>applyFormat('italic')},{key:'Mod-k',run:()=>applyFormat('link')},
       {key:'Escape',run:()=>{const current=selectedSnapshot();suppressedSelection=current?`${current.id}:${current.from}:${current.to}`:null;hideToolbar();return true;}},
+      {key:'Tab',run:()=>acceptCompletion(view)},
       ...historyKeymap,...markdownKeymap,...defaultKeymap,indentWithTab
     ]),
     EditorView.updateListener.of(update=>{
@@ -413,11 +667,33 @@ function createState(doc) {
       }
       if(update.selectionSet) suppressedSelection=null;
       if(update.docChanged||update.selectionSet||update.viewportChanged||update.focusChanged||update.geometryChanged)scheduleToolbar();
+      if(update.docChanged)scheduleWikiCompletion();
+      if(update.transactions.some(transaction=>transaction.effects.some(effect=>effect.is(linkMetadataEffect))))scheduleWikiCompletion();
     }),
     EditorView.domEventHandlers({
       beforeinput(event) {if(caretMotion&&['insertText','deleteContentBackward'].includes(event.inputType)&&!event.isComposing)caretMotion.inputIntent=performance.now();return false;},
-      pointerdown() {caretMotion?.snap();return false;},
-      keydown(event) {if(event.metaKey||event.ctrlKey||event.altKey||event.key.length!==1&&event.key!=='Backspace')caretMotion?.snap();return false;},
+      pointerdown(event,editor) {
+        caretMotion?.snap();
+        if(event.metaKey||event.ctrlKey) {
+          const rendered=event.target.closest?.('[data-still-link-kind]');
+          if(rendered&&!rendered.classList.contains('md-wiki-link')) {
+            if(activateRenderedLink(rendered)){event.preventDefault();event.stopPropagation();return true;}
+          } else if(!rendered) {
+            const position=editor.posAtCoords({x:event.clientX,y:event.clientY},false);
+            if(position!==null&&activateAtPosition(position)){event.preventDefault();event.stopPropagation();return true;}
+          }
+        }
+        return false;
+      },
+      keydown(event,editor) {
+        if(event.key==='Enter') {
+          const rendered=event.target.closest?.('[data-still-link-kind]');
+          const activated=rendered?activateRenderedLink(rendered):event.metaKey||event.ctrlKey?activateAtPosition(editor.state.selection.main.head):false;
+          if(activated){event.preventDefault();return true;}
+        }
+        if(event.metaKey||event.ctrlKey||event.altKey||event.key.length!==1&&event.key!=='Backspace')caretMotion?.snap();
+        return false;
+      },
       compositionstart() {if(caretMotion){caretMotion.composing=true;caretMotion.snap();}return false;},
       compositionend() {if(caretMotion){caretMotion.composing=false;caretMotion.snap();caretMotion.measure(false);}return false;},
       focus(event,editor) {editor.dispatch({effects:focusEffect.of(true)});post({type:'focus',id:documentId,focused:true});return false;},
@@ -454,11 +730,16 @@ window.stillEditor={
     strings=localized;aiAvailable=available;
     this.setAppearance({theme,reduceMotion});
     if(sameSource) {
-      if(localizationChanged)view.dispatch({effects:localizedExtension.reconfigure(localizedExtensions())});
+      if(localizationChanged)view.dispatch({effects:[localizedExtension.reconfigure(localizedExtensions()),linkMetadataEffect.of(activeLinkMetadata)]});
       if(localizationChanged||availabilityChanged){makeToolbar();scheduleToolbar();}
       return;
     }
     const oldSelection=view.state.selection.main;
+    if(!sameDocument)closeCompletion(view);
+    if(!sameDocument) {
+      activeLinkMetadata=pendingLinkMetadata?.id===id?pendingLinkMetadata:{id,documents:[]};
+      pendingLinkMetadata=null;
+    }
     documentId=id;stableSelection=null;suppressedSelection=null;pendingImages.clear();caretMotion?.snap();hideToolbar(true);
     if(!sameDocument){aiBusy=false;aiLabel=null;}
     let state=createState(source);
@@ -468,6 +749,15 @@ window.stillEditor={
     post({type:'focus',id:documentId,focused:view.hasFocus});
     if(!sameDocument)view.scrollDOM.scrollTop=0;
     makeToolbar();
+  },
+  setLinkDocuments({id,documents=[]}) {
+    if(typeof id!=='string')return;
+    const safeDocuments=sanitizeLinkDocuments(documents);
+    const snapshot={id,documents:safeDocuments};
+    if(id!==documentId){pendingLinkMetadata=snapshot;return;}
+    activeLinkMetadata=snapshot;
+    view.dispatch({effects:linkMetadataEffect.of(snapshot)});
+    scheduleWikiCompletion();
   },
   setAIState({busy=false,label}) {
     const nextLabel=label??null;

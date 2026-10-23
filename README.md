@@ -34,6 +34,10 @@ AI is off by default. Add an HTTPS OpenAI-compatible endpoint (or a local HTTP e
 
 Markdown is stored as plain `.md` files. Images imported through the editor are saved in the workspace’s `attachments` folder.
 
+## Links between notes
+
+Type `[[Page title]]` to link a note or Wiki page; `[[Page title|label]]` displays a custom label. The editor offers matching notes while you type. Use a full target such as `[[wiki/Guides/Getting started]]` when titles are ambiguous. Press ⌘-click or ⌘↩ on a link to open it; a missing target can be created in the current section and folder. Links to external HTTP(S) and email addresses open in the default app. The editor shows backlinks below the note, and ⌘[ returns to the previous note. Link targets are updated when a linked note or folder is renamed or moved.
+
 ## License
 
 Copyright (C) 2026 Luke Schröter. `still` is licensed under the GNU General Public License, version 3 or (at your option) any later version; see [`LICENSE`](LICENSE). Third-party dependencies remain under their respective licenses; see the bundled [third-party notices](Sources/Still/Resources/Editor/THIRD_PARTY_NOTICES.txt).

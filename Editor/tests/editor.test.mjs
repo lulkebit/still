@@ -31,6 +31,10 @@ const select=async(from,to=from)=>{
   await page.locator('.cm-content').evaluate((content,{from,to})=>{const view=content.cmTile.root.view;view.dispatch({selection:{anchor:from,head:to},scrollIntoView:true});view.focus();},{from,to});
   await page.waitForTimeout(50);
 };
+const waitForCompletionLabels=expected=>page.waitForFunction(values=>{
+  const actual=[...document.querySelectorAll('.cm-tooltip-autocomplete .cm-completionLabel')].map(label=>label.textContent);
+  return actual.length===values.length&&actual.every((label,index)=>label===values[index]);
+},expected);
 const tests=[];
 function test(name,body){tests.push([name,body]);}
 test('source fidelity, active syntax and live styled typography',async()=>{
@@ -144,6 +148,157 @@ test('fenced code protects literal task, table and emphasis syntax',async()=>{
   assert.equal(await page.locator('.md-disclosure').count(),0);
   assert.equal(await page.locator('.md-bold').count(),0);
   assert.ok((await page.locator('.cm-content').textContent()).includes('**literal**'));
+});
+const linkDocuments=[
+  {id:'doc-1',title:'Source',section:'notes',folders:['Garden'],target:'notes/Garden/Source'},
+  {id:'note-fern',title:'Fern',section:'notes',folders:['Garden'],target:'notes/Garden/Fern'},
+  {id:'wiki-fern',title:'Fern',section:'wiki',folders:['Plants'],target:'wiki/Plants/Fern'},
+  {id:'special',title:'A/B [Fern]|%',section:'wiki',folders:['Plants'],target:'wiki/Plants/A%2FB%20%5BFern%5D%7C%25'}
+];
+test('wiki links render aliases, resolve within source context and activate through the native bridge',async()=>{
+  const markdown='[[Fern|my plant]] · [[wiki/Plants/Fern]] · [[Missing]]';
+  await load(markdown,'doc-1');
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  await page.locator('.cm-content').evaluate(content=>content.blur());
+  const links=page.locator('.md-wiki-link');
+  assert.equal(await links.count(),3);
+  assert.equal(await links.nth(0).textContent(),'my plant');
+  assert.ok((await links.nth(0).getAttribute('class')).includes('is-resolved'),'Same-folder note should win a duplicate-title match');
+  assert.equal(await links.nth(1).textContent(),'Fern');
+  assert.ok((await links.nth(1).getAttribute('class')).includes('is-resolved'),'Canonical paths resolve a specific wiki target');
+  assert.equal(await links.nth(2).getAttribute('title'),'Nicht gefunden – mit ⌘-Klick erstellen: Missing');
+  await links.nth(0).click({modifiers:['Meta']});
+  let message=await page.evaluate(()=>window.messages.filter(item=>item.type==='openWikiLink').at(-1));
+  assert.deepEqual(message,{type:'openWikiLink',id:'doc-1',target:'Fern',from:0,to:'[[Fern|my plant]]'.length,original:'[[Fern|my plant]]'});
+  await links.nth(2).focus();await page.keyboard.press('Enter');
+  message=await page.evaluate(()=>window.messages.filter(item=>item.type==='openWikiLink').at(-1));
+  assert.equal(message.target,'Missing');assert.equal(message.original,'[[Missing]]');
+  await links.nth(1).click();
+  assert.equal(await page.locator('.cm-content').evaluate(content=>content===document.activeElement),true,'A normal click returns the rendered token to editing');
+  assert.equal(await source(),markdown);
+});
+test('wiki autocomplete filters notes and wiki paths and supports pointer and keyboard selection',async()=>{
+  await load('','doc-1');
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  await page.keyboard.type('[[');
+  await page.locator('.cm-tooltip-autocomplete').waitFor();
+  let labels=await page.locator('.cm-tooltip-autocomplete .cm-completionLabel').allTextContents();
+  assert.ok(labels.includes('Source')&&labels.includes('Fern'),'Suggestions include both the current note and wiki targets');
+  await page.keyboard.type('wiki/Plants/Fern');
+  await waitForCompletionLabels(['Fern']);
+  labels=await page.locator('.cm-tooltip-autocomplete .cm-completionLabel').allTextContents();
+  assert.deepEqual(labels,['Fern']);
+  await page.keyboard.press('Enter');
+  assert.equal(await source(),'[[wiki/Plants/Fern]]');
+  await page.keyboard.press('Meta+z');assert.equal(await source(),'[[wiki/Plants/Fern','Undo restores the full query that completion replaced');
+  await load('','doc-1');await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  await page.keyboard.type('[[wiki/Plants/Fern');await waitForCompletionLabels(['Fern']);
+  await page.keyboard.press('Tab');assert.equal(await source(),'[[wiki/Plants/Fern]]','Tab accepts the selected completion before the editor indents');
+  await load('','doc-1');await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  await page.keyboard.type('[[A/B');await waitForCompletionLabels(['A/B [Fern]|%']);
+  await page.locator('.cm-tooltip-autocomplete li').filter({hasText:'A/B [Fern]|%'}).click();
+  assert.equal(await source(),'[[wiki/Plants/A%2FB%20%5BFern%5D%7C%25]]','Delimiter titles use their canonical escaped target');
+  await load('','doc-1');await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  await page.keyboard.type('[[Fe');await waitForCompletionLabels(['A/B [Fern]|%','Fern','Fern']);
+  await page.getByRole('option',{name:'Fern Wiki · Plants',exact:true}).click();
+  assert.equal(await source(),'[[wiki/Plants/Fern]]','Pointer selection inserts the selected duplicate target unambiguously');
+
+  const cafeDocuments=[
+    {id:'doc-1',title:'Source',section:'notes',folders:['Garden'],target:'notes/Garden/Source'},
+    {id:'cafe-note',title:'Cafe',section:'notes',folders:['Garden'],target:'notes/Garden/Cafe'},
+    {id:'cafe-wiki',title:'Café',section:'wiki',folders:['Plants'],target:'wiki/Plants/Café'}
+  ];
+  await load('','doc-1');await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),cafeDocuments);
+  await page.keyboard.type('[[Caf');
+  await page.waitForFunction(()=>{
+    const labels=[...document.querySelectorAll('.cm-tooltip-autocomplete .cm-completionLabel')].map(item=>item.textContent);
+    return labels.length===2&&labels.includes('Cafe')&&labels.includes('Café');
+  });
+  await page.getByRole('option',{name:'Café Wiki · Plants',exact:true}).click();
+  assert.equal(await source(),'[[wiki/Plants/Café]]','Fold-equivalent titles use the canonical target to avoid resolving to the source-local duplicate');
+});
+test('wiki autocomplete stays closed when editing inside an already complete token',async()=>{
+  await load('[[Fern]]','doc-1');
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  await select(4);
+  await page.waitForTimeout(120);
+  assert.equal(await page.locator('.cm-tooltip-autocomplete').count(),0,'A completion must not leave stale closing brackets after replacing a complete token');
+  assert.equal(await source(),'[[Fern]]');
+});
+test('wiki metadata refresh preserves document, cursor, selection and undo history',async()=>{
+  await load('Fern body','doc-1');await select(0,4);
+  await page.locator('[data-action=bold]').click();
+  const markdown=await source(),before=await page.locator('.cm-content').evaluate(content=>{const range=content.cmTile.root.view.state.selection.main;return{anchor:range.anchor,head:range.head};});
+  const history=await page.evaluate(()=>window.stillEditor.historyState());
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  const after=await page.locator('.cm-content').evaluate(content=>{const range=content.cmTile.root.view.state.selection.main;return{anchor:range.anchor,head:range.head};});
+  assert.deepEqual(after,before);assert.deepEqual(await page.evaluate(()=>window.stillEditor.historyState()),history);assert.equal(await source(),markdown);
+  await page.keyboard.press('Meta+z');assert.equal(await source(),'Fern body');
+
+  await load('[[wiki/Plants/Fern]] body','doc-1');
+  const metadata=structuredClone(linkDocuments);
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),metadata);
+  await page.locator('.cm-content').evaluate(content=>content.blur());
+  const link=page.locator('.md-wiki-link');
+  assert.equal(await link.textContent(),'Fern');
+  const beforeRename={history:await page.evaluate(()=>window.stillEditor.historyState()),cursor:await page.locator('.cm-content').evaluate(content=>content.cmTile.root.view.state.selection.main.head)};
+  metadata.find(document=>document.id==='wiki-fern').title='Fern renamed';
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),metadata);
+  assert.equal(await link.textContent(),'Fern renamed','A metadata-only rename refreshes the rendered link label');
+  assert.match(await link.getAttribute('title'),/Fern renamed/,'The refreshed label also updates the link tooltip');
+  assert.deepEqual(await page.evaluate(()=>window.stillEditor.historyState()),beforeRename.history);
+  assert.equal(await page.locator('.cm-content').evaluate(content=>content.cmTile.root.view.state.selection.main.head),beforeRename.cursor);
+});
+test('wiki parsing excludes escaped, code, image-alt and HTML-comment tokens',async()=>{
+  const markdown='`[[Inline]]`\n\n    [[Indented]]\n\n```md\n[[Fenced]]\n```\n\n![alt [[Image]]](attachments/x.png)\n\n\\[[Escaped]]\n\n<!-- [[Comment]] -->\n\n[[Visible]]';
+  await load(markdown,'doc-1');await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  await page.locator('.cm-content').evaluate(content=>content.blur());
+  assert.deepEqual(await page.locator('.md-wiki-link').allTextContents(),['Visible']);
+  assert.equal(await source(),markdown);
+});
+test('Markdown links and GFM autolinks open only allowed web and mail URLs',async()=>{
+  await load('[Site](https://example.com/path) and [Mail](mailto:hello@example.com) and [Unsafe](javascript:alert(1)) and <https://auto.example> and https://bare.example/path.','doc-1');
+  await page.locator('.cm-content').evaluate(content=>content.blur());
+  const links=page.locator('.md-link[role=link]');
+  assert.equal(await links.count(),4);
+  assert.equal(await links.nth(0).getAttribute('role'),'link');
+  assert.equal(await links.nth(0).getAttribute('tabindex'),'0');
+  await links.nth(0).click({modifiers:['Meta']});
+  let message=await page.evaluate(()=>window.messages.filter(item=>item.type==='openExternalLink').at(-1));
+  assert.deepEqual(message,{type:'openExternalLink',id:'doc-1',url:'https://example.com/path'});
+  await links.nth(1).focus();await page.keyboard.press('Enter');
+  message=await page.evaluate(()=>window.messages.filter(item=>item.type==='openExternalLink').at(-1));
+  assert.equal(message.url,'mailto:hello@example.com');
+  await page.locator('[data-still-link-url="https://auto.example/"]').click({modifiers:['Meta']});
+  message=await page.evaluate(()=>window.messages.filter(item=>item.type==='openExternalLink').at(-1));assert.equal(message.url,'https://auto.example/');
+  await page.locator('[data-still-link-url="https://bare.example/path"]').click({modifiers:['Meta']});
+  message=await page.evaluate(()=>window.messages.filter(item=>item.type==='openExternalLink').at(-1));assert.equal(message.url,'https://bare.example/path');
+  await page.locator('.md-link').filter({hasText:'Unsafe'}).click({modifiers:['Meta']});
+  assert.equal((await page.evaluate(()=>window.messages.filter(item=>item.type==='openExternalLink').length)),4,'Unsafe URL schemes never reach native navigation');
+});
+test('wiki resolution folds case and accents, preserves path separators and rejects malformed escapes',async()=>{
+  const markdown='[[cafe]] · [[WIKI/PLANTS/cafe]] · [[wiki//Plants/Café]] · [[wiki\\Plants\\Café]] · [[bad%]] · [[A/B [Fern]|x]] · [[wiki/A%2FB]] · [[wiki/A/B]]';
+  await load(markdown,'doc-1');
+  const docs=[
+    {id:'doc-1',title:'Source',section:'notes',folders:['Garden'],target:'notes/Garden/Source'},
+    {id:'cafe-note',title:'Café',section:'notes',folders:['Garden'],target:'notes/Garden/Café'},
+    {id:'cafe-wiki',title:'Café',section:'wiki',folders:['Plants'],target:'wiki/Plants/Café'},
+    {id:'slash-title',title:'wiki//Plants/Café',section:'notes',folders:['Odd'],target:'notes/Odd/Slash'},
+    {id:'encoded-slash',title:'A/B',section:'wiki',folders:[],target:'wiki/A%2FB'},
+    {id:'folder-and-title',title:'B',section:'wiki',folders:['A'],target:'wiki/A/B'}
+  ];
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),docs);
+  await page.locator('.cm-content').evaluate(content=>content.blur());
+  const rendered=page.locator('.md-wiki-link');
+  assert.equal(await rendered.nth(0).getAttribute('class').then(value=>value.includes('is-resolved')),true,'Short names match case and accents');
+  assert.equal(await rendered.nth(1).getAttribute('class').then(value=>value.includes('is-resolved')),true,'Canonical paths match case and accents');
+  assert.equal(await rendered.nth(2).getAttribute('class').then(value=>value.includes('is-unresolved')),true,'Empty slash components are preserved');
+  assert.equal(await rendered.nth(3).getAttribute('class').then(value=>value.includes('is-unresolved')),true,'Backslashes are preserved rather than normalized as path separators');
+  assert.equal(await rendered.nth(4).getAttribute('class').then(value=>value.includes('is-unresolved')),true,'Invalid percent escapes remain unresolved');
+  assert.equal(await rendered.nth(5).textContent(),'x','Aliases still render when the target needs canonical escaping');
+  assert.equal(await rendered.nth(5).getAttribute('class').then(value=>value.includes('is-unresolved')),true,'Qualified targets do not fall back to a similarly named short title');
+  assert.equal(await rendered.nth(6).getAttribute('class').then(value=>value.includes('is-resolved')),true,'An encoded slash stays inside its target component');
+  assert.equal(await rendered.nth(7).getAttribute('class').then(value=>value.includes('is-resolved')),true,'A literal path separator stays a component boundary');
 });
 test('AI replacement checks document, range and original; document changes reset undo',async()=>{
   await load('🪴 old text');

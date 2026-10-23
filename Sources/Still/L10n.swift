@@ -18,7 +18,10 @@ enum L10n {
             "editor.heading2", "editor.quote", "editor.code", "editor.link",
             "editor.wikiAction", "editor.optimizeAction", "editor.emptyTitle", "editor.emptyBody",
             "editor.selectTextHint", "editor.imageAlt", "editor.editSource", "editor.importImage",
-            "editor.selectionToolbar", "editor.busy", "editor.openLink", "editor.table"
+            "editor.selectionToolbar", "editor.busy", "editor.openLink", "editor.table",
+            "editor.linkOpenNote", "editor.linkOpenWiki", "editor.linkCreateMissing",
+            "editor.linkAmbiguous", "editor.linkExternal", "editor.linkSectionNotes",
+            "editor.linkSectionWiki"
         ]
         return Dictionary(uniqueKeysWithValues: keys.map { ($0, text($0)) })
     }

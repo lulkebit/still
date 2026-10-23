@@ -3,6 +3,80 @@ import SwiftUI
 import WebKit
 import Observation
 
+struct WikiLinkRequest: Equatable {
+    let id: UUID
+    let target: String
+    let from: Int
+    let to: Int
+    let original: String
+
+    var range: NSRange { NSRange(location: from, length: to - from) }
+}
+
+struct EditorLinkDocument: Equatable {
+    let id: String
+    let title: String
+    let section: String
+    let folders: [String]
+    let target: String
+
+    init(note: Note) {
+        id = note.id.uuidString
+        title = note.title
+        section = note.section.rawValue
+        folders = note.folders
+        target = NoteLinks.target(for: note)
+    }
+
+    var payload: [String: Any] {
+        ["id": id, "title": title, "section": section, "folders": folders, "target": target]
+    }
+}
+
+enum EditorLinkRequestPolicy {
+    static func wikiLinkRequest(body: [String: Any], currentDocumentID: UUID?, markdown: String) -> WikiLinkRequest? {
+        guard body["type"] as? String == "openWikiLink",
+              let idText = body["id"] as? String, let id = UUID(uuidString: idText),
+              id == currentDocumentID,
+              let target = body["target"] as? String,
+              let from = body["from"] as? Int, let to = body["to"] as? Int,
+              let original = body["original"] as? String else { return nil }
+        let request = WikiLinkRequest(id: id, target: target, from: from, to: to, original: original)
+        return isCurrent(request, currentDocumentID: currentDocumentID, markdown: markdown) ? request : nil
+    }
+
+    static func isCurrent(_ request: WikiLinkRequest, currentDocumentID: UUID?, markdown: String) -> Bool {
+        let source = markdown as NSString
+        guard request.id == currentDocumentID,
+              request.from >= 0, request.to > request.from, request.to <= source.length,
+              source.substring(with: request.range) == request.original else { return false }
+        return NoteLinks.links(in: markdown).contains {
+            $0.range == request.range && $0.target == request.target
+        }
+    }
+
+    static func externalURL(body: [String: Any], currentDocumentID: UUID?) -> URL? {
+        guard body["type"] as? String == "openExternalLink",
+              let idText = body["id"] as? String, let id = UUID(uuidString: idText),
+              id == currentDocumentID,
+              let rawURL = body["url"] as? String,
+              !rawURL.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              let components = URLComponents(string: rawURL),
+              let scheme = components.scheme?.lowercased(), let url = components.url else { return nil }
+        switch scheme {
+        case "http", "https":
+            guard let host = components.host, !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  components.user == nil, components.password == nil else { return nil }
+        case "mailto":
+            guard components.host == nil,
+                  !components.path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        default:
+            return nil
+        }
+        return url
+    }
+}
+
 struct EditorCommand: Identifiable {
     enum Kind {
         case insertMarkdown(String, documentID: UUID)
@@ -86,10 +160,13 @@ struct MarkdownEditor: NSViewRepresentable {
     var colorScheme: ColorScheme
     var reduceMotion: Bool
     var onWikiCreated: (Note) -> Void
+    var onOpenWikiLink: (WikiLinkRequest) -> Void
+    var onOpenExternalLink: (URL) -> Void
     var commands: EditorCommandBus
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(appModel: appModel, onWikiCreated: onWikiCreated)
+        Coordinator(appModel: appModel, onWikiCreated: onWikiCreated,
+                    onOpenWikiLink: onOpenWikiLink, onOpenExternalLink: onOpenExternalLink)
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -114,6 +191,8 @@ struct MarkdownEditor: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         context.coordinator.onWikiCreated = onWikiCreated
+        context.coordinator.onOpenWikiLink = onOpenWikiLink
+        context.coordinator.onOpenExternalLink = onOpenExternalLink
         context.coordinator.apply(note: note, colorScheme: colorScheme, reduceMotion: reduceMotion, commands: commands)
     }
 
@@ -133,6 +212,8 @@ struct MarkdownEditor: NSViewRepresentable {
     final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let appModel: StillAppModel
         var onWikiCreated: (Note) -> Void
+        var onOpenWikiLink: (WikiLinkRequest) -> Void
+        var onOpenExternalLink: (URL) -> Void
         weak var webView: WKWebView?
         weak var commandBus: EditorCommandBus?
         var editorHTMLURL: URL?
@@ -144,10 +225,16 @@ struct MarkdownEditor: NSViewRepresentable {
         private var currentAIAvailable = false
         private var isReady = false
         private var isEditorFocused = false
+        private var lastLinkDocumentsSourceID: UUID?
+        private var lastLinkDocuments: [EditorLinkDocument]?
 
-        init(appModel: StillAppModel, onWikiCreated: @escaping (Note) -> Void) {
+        init(appModel: StillAppModel, onWikiCreated: @escaping (Note) -> Void,
+             onOpenWikiLink: @escaping (WikiLinkRequest) -> Void,
+             onOpenExternalLink: @escaping (URL) -> Void) {
             self.appModel = appModel
             self.onWikiCreated = onWikiCreated
+            self.onOpenWikiLink = onOpenWikiLink
+            self.onOpenExternalLink = onOpenExternalLink
         }
 
         func apply(note: Note?, colorScheme: ColorScheme, reduceMotion: Bool, commands: EditorCommandBus) {
@@ -172,6 +259,15 @@ struct MarkdownEditor: NSViewRepresentable {
             let appearanceChanged = currentTheme != theme || currentReduceMotion != reduceMotion
             let availabilityChanged = currentAIAvailable != aiAvailable
             currentDocumentID = note.id
+            let linkDocuments = appModel.store.notes.map(EditorLinkDocument.init(note:))
+            if isReady && (lastLinkDocumentsSourceID != note.id || lastLinkDocuments != linkDocuments) {
+                invoke("setLinkDocuments", payload: [
+                    "id": note.id.uuidString,
+                    "documents": linkDocuments.map(\.payload)
+                ])
+                lastLinkDocumentsSourceID = note.id
+                lastLinkDocuments = linkDocuments
+            }
             if documentChanged || availabilityChanged {
                 pushedMarkdown = note.markdown
                 currentAIAvailable = aiAvailable
@@ -223,6 +319,15 @@ struct MarkdownEditor: NSViewRepresentable {
                 let from = body["from"] as? Int ?? 0
                 let to = body["to"] as? Int ?? from
                 Task { await perform(action: action, id: id, text: text, from: from, to: to) }
+            case "openWikiLink":
+                guard let id = currentDocumentID,
+                      let source = appModel.store.notes.first(where: { $0.id == id }),
+                      let request = EditorLinkRequestPolicy.wikiLinkRequest(body: body, currentDocumentID: id,
+                                                                            markdown: source.markdown) else { return }
+                onOpenWikiLink(request)
+            case "openExternalLink":
+                guard let url = EditorLinkRequestPolicy.externalURL(body: body, currentDocumentID: currentDocumentID) else { return }
+                onOpenExternalLink(url)
             case "importImage":
                 importImage(body)
             case "toggleSidebar":

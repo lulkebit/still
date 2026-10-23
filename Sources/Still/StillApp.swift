@@ -6,10 +6,11 @@ struct StillApp: App {
     @NSApplicationDelegateAdaptor(StillAppDelegate.self) private var appDelegate
     @State private var appModel = StillAppModel()
     @State private var editorCommands = EditorCommandBus()
+    @State private var noteNavigation = NoteNavigationHistory()
 
     var body: some Scene {
         Window(L10n.text("app.name"), id: "main") {
-            ContentView(appModel: appModel, commandBus: editorCommands)
+            ContentView(appModel: appModel, commandBus: editorCommands, noteNavigation: noteNavigation)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     appModel.store.flushPendingWrites()
                 }
@@ -38,6 +39,12 @@ struct StillApp: App {
                     NotificationCenter.default.post(name: .stillFocusSearch, object: nil)
                 }
                 .keyboardShortcut("f", modifiers: .command)
+
+                Button(L10n.text("nav.back")) {
+                    NotificationCenter.default.post(name: .stillNavigateBack, object: nil)
+                }
+                .keyboardShortcut("[", modifiers: .command)
+                .disabled(!noteNavigation.canGoBack)
             }
             CommandGroup(replacing: .sidebar) {
                 Button(L10n.text("sidebar.toggle")) {
@@ -59,6 +66,7 @@ final class StillAppDelegate: NSObject, NSApplicationDelegate {
 extension Notification.Name {
     static let stillFocusSearch = Notification.Name("still.focusSearch")
     static let stillToggleSidebar = Notification.Name("still.toggleSidebar")
+    static let stillNavigateBack = Notification.Name("still.navigateBack")
 }
 
 struct WindowConfigurator: NSViewRepresentable {

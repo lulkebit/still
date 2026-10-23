@@ -5,6 +5,7 @@
 "nav.trash" = "Papierkorb";
 "nav.settings" = "Einstellungen";
 "nav.search" = "Suchen";
+"nav.back" = "Zur vorherigen Notiz zurückkehren";
 "sidebar.folders" = "Ordner";
 "sidebar.newNote" = "Neue Notiz";
 "sidebar.newFolder" = "Neuer Ordner";
@@ -118,6 +119,9 @@
 "dialog.newFolder" = "Neuer Ordner";
 "dialog.renameFolder" = "Ordner umbenennen";
 "dialog.renameNote" = "Notiz umbenennen";
+"dialog.createLinkedNoteTitle" = "Seite anlegen?";
+"dialog.createLinkedNoteAction" = "Anlegen";
+"dialog.createLinkedNoteBody" = "„%@“ unter %@ anlegen?";
 "dialog.name" = "Name";
 "dialog.namePlaceholder" = "Name eingeben";
 "dialog.deleteFolderTitle" = "Ordner in den Papierkorb legen?";
@@ -144,6 +148,15 @@
 "editor.busy" = "Wird verarbeitet …";
 "editor.openLink" = "Link öffnen";
 "editor.table" = "Tabelle";
+"editor.linkOpenNote" = "Notiz mit ⌘-Klick öffnen";
+"editor.linkOpenWiki" = "Wiki-Seite mit ⌘-Klick öffnen";
+"editor.linkCreateMissing" = "Fehlendes Ziel mit ⌘-Klick erstellen";
+"editor.linkAmbiguous" = "Mehrdeutiger Link. Nutze die Autovervollständigung oder ergänze den Pfad.";
+"editor.linkInvalid" = "Dieses Linkziel ist ungültig.";
+"editor.linkExternal" = "Weblink mit ⌘-Klick öffnen";
+"editor.linkSectionNotes" = "Notizen";
+"editor.linkSectionWiki" = "Wiki";
+"editor.backlinks" = "Verlinkt von";
 "editor.tableColumn1" = "Spalte 1";
 "editor.tableColumn2" = "Spalte 2";
 "editor.detailsSummary" = "Mehr anzeigen";
@@ -152,6 +165,8 @@
 "error.readOnly" = "Der Arbeitsbereich konnte nicht sicher geladen werden und ist schreibgeschützt.";
 "error.save" = "Änderungen konnten nicht vollständig gespeichert werden. Deine aktuelle Eingabe bleibt geöffnet.";
 "error.operationFailed" = "Die Aktion konnte nicht abgeschlossen werden.";
+"error.invalidWikiLink" = "Dieses interne Linkziel ist ungültig.";
+"error.ambiguousWikiLink" = "Dieses interne Linkziel ist mehrdeutig. Nutze die Autovervollständigung oder ergänze den Pfad.";
 "error.invalidAIResponse" = "Die KI hat keine gültigen neuen Wiki-Seiten zurückgegeben.";
 "error.emptyTitle" = "Bitte gib einen Titel ein.";
 "error.imageTooLarge" = "Das Bild ist zu groß. Die Grenze liegt bei 20 MB.";

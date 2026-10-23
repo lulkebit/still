@@ -43,8 +43,11 @@ struct ContentView: View {
     @State private var noteToTrash: UUID?
     @State private var showFolderTrashConfirmation = false
     @State private var showNoteTrashConfirmation = false
+    @State private var pendingWikiLink: WikiLinkRequest?
+    @State private var showingMissingWikiLink = false
     let appModel: StillAppModel
     let commandBus: EditorCommandBus
+    let noteNavigation: NoteNavigationHistory
 
     private var store: StillStore { appModel.store }
     private var selectedNote: Note? { store.notes.first(where: { $0.id == selectedNoteID }) }
@@ -64,7 +67,11 @@ struct ContentView: View {
         .background(WindowConfigurator(reduceTransparency: reduceTransparency).frame(width: 0, height: 0))
         .frame(minWidth: 960, minHeight: 640)
         .overlay(alignment: .top) { statusBanner }
-        .onAppear(perform: restoreLastNote)
+        .onAppear {
+            noteNavigation.updateNotes(store.notes)
+            restoreLastNote()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .stillNavigateBack)) { _ in navigateBack() }
         .onReceive(NotificationCenter.default.publisher(for: .stillToggleSidebar)) { _ in
             toggleSidebarFromShortcut()
         }
@@ -82,9 +89,14 @@ struct ContentView: View {
         .onChange(of: folderPath) { _, path in
             guard !showTrash, activeSection != .tasks else { return }
             if let selectedNote, selectedNote.section == currentNoteSection, selectedNote.folders == path { return }
-            selectedNoteID = store.notes(in: currentNoteSection, folderPath: path).first?.id
+            let nextID = store.notes(in: currentNoteSection, folderPath: path).first?.id
+            noteNavigation.record(from: selectedNoteID, to: nextID)
+            selectedNoteID = nextID
         }
-        .onChange(of: store.notes) { _, newNotes in repairSelection(after: newNotes) }
+        .onChange(of: store.notes) { _, newNotes in
+            noteNavigation.updateNotes(newNotes)
+            repairSelection(after: newNotes)
+        }
         .onChange(of: showTrash) { _, isTrash in
             if isTrash { selectedTrashID = store.trash.first?.id }
         }
@@ -109,6 +121,16 @@ struct ContentView: View {
             Button(L10n.text("action.cancel"), role: .cancel) { noteToTrash = nil }.pointerStyle(.link)
         } message: {
             noteDeleteMessage
+        }
+        .confirmationDialog(
+            L10n.text("dialog.createLinkedNoteTitle"),
+            isPresented: $showingMissingWikiLink,
+            titleVisibility: .visible
+        ) {
+            Button(L10n.text("dialog.createLinkedNoteAction")) { createMissingWikiLink() }.pointerStyle(.link)
+            Button(L10n.text("action.cancel"), role: .cancel) { pendingWikiLink = nil }.pointerStyle(.link)
+        } message: {
+            Text(verbatim: missingWikiLinkDetails)
         }
     }
 
@@ -202,7 +224,12 @@ struct ContentView: View {
         } else {
             MainDocumentView(note: selectedNote, breadcrumb: breadcrumb, appModel: appModel,
                              commands: commandBus, reduceMotion: reduceMotion,
-                             onWikiCreated: { openNote(id: $0.id) })
+                             canNavigateBack: noteNavigation.canGoBack,
+                             onNavigateBack: navigateBack,
+                             onOpenNote: { openNote(id: $0) },
+                             onWikiCreated: { openNote(id: $0.id) },
+                             onOpenWikiLink: openWikiLink,
+                             onOpenExternalLink: openExternalLink)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
@@ -293,6 +320,7 @@ struct ContentView: View {
             if section != .tasks {
                 let noteSection: NoteSection = section == .wiki ? .wiki : .notes
                 let note = store.notes(in: noteSection).first
+                noteNavigation.record(from: selectedNoteID, to: note?.id)
                 selectedNoteID = note?.id
             }
         }
@@ -314,21 +342,80 @@ struct ContentView: View {
     private func createNote() {
         do {
             let note = try store.createNote(section: currentNoteSection, folders: folderPath)
-            selectedNoteID = note.id
-            showTrash = false
-            activeSection = note.section == .wiki ? .wiki : .notes
-            folderDisclosureState.expandAncestors(section: note.section, path: note.folders)
+            openNote(id: note.id)
         } catch { store.report(error) }
     }
 
     private func openNote(id: UUID) {
         guard let note = store.notes.first(where: { $0.id == id }) else { return }
+        noteNavigation.record(from: selectedNoteID, to: note.id)
+        openNoteWithoutRecording(note)
+    }
+
+    private func openNoteWithoutRecording(_ note: Note) {
         showTrash = false
         query = ""
         activeSection = note.section == .wiki ? .wiki : .notes
         folderPath = note.folders
         selectedNoteID = note.id
         folderDisclosureState.expandAncestors(section: note.section, path: note.folders)
+    }
+
+    private func navigateBack() {
+        guard let id = noteNavigation.popPrevious(),
+              let note = store.notes.first(where: { $0.id == id }) else { return }
+        openNoteWithoutRecording(note)
+    }
+
+    private func openWikiLink(_ request: WikiLinkRequest) {
+        guard selectedNoteID == request.id,
+              let source = store.notes.first(where: { $0.id == request.id }),
+              EditorLinkRequestPolicy.isCurrent(request, currentDocumentID: selectedNoteID, markdown: source.markdown) else { return }
+        switch NoteLinks.resolution(target: request.target, from: source, notes: store.notes) {
+        case let .resolved(note):
+            openNote(id: note.id)
+        case .missing:
+            pendingWikiLink = request
+            showingMissingWikiLink = true
+        case .ambiguous:
+            store.report(StoreError.ambiguousWikiLink)
+        case .invalid:
+            store.report(StoreError.invalidWikiLink)
+        }
+    }
+
+    private func createMissingWikiLink() {
+        defer { pendingWikiLink = nil }
+        guard let request = pendingWikiLink,
+              selectedNoteID == request.id,
+              let source = store.notes.first(where: { $0.id == request.id }),
+              EditorLinkRequestPolicy.isCurrent(request, currentDocumentID: selectedNoteID, markdown: source.markdown) else { return }
+        switch NoteLinks.resolution(target: request.target, from: source, notes: store.notes) {
+        case let .resolved(note):
+            openNote(id: note.id)
+        case .missing:
+            do { openNote(id: try store.createLinkedNote(target: request.target, from: source).id) }
+            catch { store.report(error) }
+        case .ambiguous:
+            store.report(StoreError.ambiguousWikiLink)
+        case .invalid:
+            store.report(StoreError.invalidWikiLink)
+        }
+    }
+
+    private var missingWikiLinkDetails: String {
+        guard let request = pendingWikiLink,
+              let source = store.notes.first(where: { $0.id == request.id }),
+              let destination = NoteLinks.destination(for: request.target, from: source) else {
+            return pendingWikiLink?.target ?? ""
+        }
+        let section = L10n.text(destination.section == .wiki ? "editor.linkSectionWiki" : "editor.linkSectionNotes")
+        let location = ([section] + destination.folders).joined(separator: " / ")
+        return String(format: L10n.text("dialog.createLinkedNoteBody"), destination.title, location)
+    }
+
+    private func openExternalLink(_ url: URL) {
+        NSWorkspace.shared.open(url)
     }
 
     private func openTask(id: UUID) {
@@ -390,11 +477,7 @@ struct ContentView: View {
         do {
             try store.restoreTrashItem(id: entry.id)
             if let restored = store.notes.first(where: { $0.id == entry.id }) {
-                showTrash = false
-                activeSection = restored.section == .wiki ? .wiki : .notes
-                folderPath = restored.folders
-                selectedNoteID = restored.id
-                folderDisclosureState.expandAncestors(section: restored.section, path: restored.folders)
+                openNote(id: restored.id)
             }
         } catch { store.report(error) }
     }
@@ -878,13 +961,28 @@ private struct MainDocumentView: View {
     let appModel: StillAppModel
     let commands: EditorCommandBus
     let reduceMotion: Bool
+    let canNavigateBack: Bool
+    let onNavigateBack: () -> Void
+    let onOpenNote: (UUID) -> Void
     let onWikiCreated: (Note) -> Void
+    let onOpenWikiLink: (WikiLinkRequest) -> Void
+    let onOpenExternalLink: (URL) -> Void
 
     var body: some View {
         VStack(spacing: 0) {
             if let note {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(alignment: .center) {
+                        Button(action: onNavigateBack) {
+                            Image(systemName: "arrow.left")
+                                .font(.system(size: 12, weight: .medium))
+                                .frame(width: 25, height: 25)
+                        }
+                        .buttonStyle(CalmButtonStyle()).pointerStyle(canNavigateBack ? .link : nil).calmHover(isEnabled: canNavigateBack)
+                        .disabled(!canNavigateBack)
+                        .help(L10n.text("nav.back"))
+                        .accessibilityLabel(L10n.text("nav.back"))
+                        .accessibilityIdentifier("note-navigation-back")
                         Text(breadcrumb).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
                         Spacer(minLength: 12)
                         Menu {
@@ -916,12 +1014,21 @@ private struct MainDocumentView: View {
                 .padding(.horizontal, 54)
                 .padding(.top, 42).padding(.bottom, 19)
 
-                MarkdownEditor(note: note, appModel: appModel, colorScheme: colorScheme, reduceMotion: reduceMotion,
-                               onWikiCreated: onWikiCreated, commands: commands)
-                    .accessibilityIdentifier("markdown-editor")
-                    .frame(maxWidth: 760, maxHeight: .infinity)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .accessibilityElement(children: .contain)
+                VStack(spacing: 0) {
+                    MarkdownEditor(note: note, appModel: appModel, colorScheme: colorScheme, reduceMotion: reduceMotion,
+                                   onWikiCreated: onWikiCreated, onOpenWikiLink: onOpenWikiLink,
+                                   onOpenExternalLink: onOpenExternalLink, commands: commands)
+                        .accessibilityIdentifier("markdown-editor")
+                        .frame(maxWidth: 760, maxHeight: .infinity)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityElement(children: .contain)
+                    let backlinkNotes = appModel.store.backlinks(to: note).sorted(by: backlinkOrder)
+                    if !backlinkNotes.isEmpty {
+                        backlinksSection(backlinkNotes)
+                    }
+                }
+                .frame(maxWidth: 760, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "note.text").font(.system(size: 26)).foregroundStyle(.tertiary)
@@ -951,6 +1058,60 @@ private struct MainDocumentView: View {
         guard trimmed != note.title else { return }
         do { try appModel.store.renameNote(id: note.id, title: trimmed) }
         catch { appModel.store.report(error); titleText = note.title }
+    }
+
+    private func backlinksSection(_ notes: [Note]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("\(L10n.text("editor.backlinks")) · \(notes.count)")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.tertiary)
+                .textCase(.uppercase)
+                .tracking(0.5)
+                .padding(.leading, 7)
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(notes) { source in
+                        Button { onOpenNote(source.id) } label: {
+                            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                                Text(source.title)
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 8)
+                                Text(([L10n.text(source.section == .wiki ? "editor.linkSectionWiki" : "editor.linkSectionNotes")] + source.folders).joined(separator: " / "))
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.tertiary)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(CalmButtonStyle())
+                        .pointerStyle(.link)
+                        .calmHover(cornerRadius: 5)
+                        .accessibilityIdentifier("backlink-\(source.id.uuidString)")
+                    }
+                }
+            }
+            .frame(maxHeight: 74)
+        }
+        // The row's 7pt inset aligns its text with the 54pt document title inset.
+        .padding(.horizontal, 47)
+        .padding(.top, 8)
+        .padding(.bottom, 2)
+        .frame(maxWidth: 760, alignment: .leading)
+        .overlay(alignment: .top) { Rectangle().fill(Color.primary.opacity(0.07)).frame(height: 0.5) }
+    }
+
+    private func backlinkOrder(_ lhs: Note, _ rhs: Note) -> Bool {
+        let titleOrder = lhs.title.localizedStandardCompare(rhs.title)
+        if titleOrder != .orderedSame { return titleOrder == .orderedAscending }
+        let lhsLocation = ([lhs.section.rawValue] + lhs.folders).joined(separator: "/")
+        let rhsLocation = ([rhs.section.rawValue] + rhs.folders).joined(separator: "/")
+        let locationOrder = lhsLocation.localizedStandardCompare(rhsLocation)
+        if locationOrder != .orderedSame { return locationOrder == .orderedAscending }
+        return lhs.id.uuidString < rhs.id.uuidString
     }
 
     private func openImagePanel(for note: Note) {

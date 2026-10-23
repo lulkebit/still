@@ -55,6 +55,19 @@ final class StillStore {
             .sorted { $0.updatedAt > $1.updatedAt }
     }
 
+    func resolveWikiLink(_ target: String, from source: Note) -> Note? {
+        NoteLinks.resolve(target: target, from: source, notes: notes)
+    }
+
+    func backlinks(to note: Note) -> [Note] {
+        notes.filter { source in
+            guard source.id != note.id else { return false }
+            return NoteLinks.links(in: source.markdown).contains { link in
+                resolveWikiLink(link.target, from: source)?.id == note.id
+            }
+        }
+    }
+
     func childFolders(in section: NoteSection, parentPath: [String]) -> [Folder] {
         folders.filter {
             $0.section == section && $0.path.count == parentPath.count + 1 && $0.path.starts(with: parentPath)
@@ -86,6 +99,28 @@ final class StillStore {
         notes = nextNotes
         errorMessage = nil
         return note
+    }
+
+    @discardableResult
+    func createLinkedNote(target: String, from source: Note) throws -> Note {
+        try ensureWritable()
+        guard let currentSource = notes.first(where: { $0.id == source.id }) else { throw StoreError.invalidWikiLink }
+        switch NoteLinks.resolution(target: target, from: currentSource, notes: notes) {
+        case let .resolved(note): return note
+        case .ambiguous: throw StoreError.ambiguousWikiLink
+        case .invalid: throw StoreError.invalidWikiLink
+        case .missing: break
+        }
+        guard let destination = NoteLinks.destination(for: target, from: currentSource) else {
+            throw StoreError.invalidWikiLink
+        }
+        let safeFolders = try PathSafety.normalizeFolderPath(destination.folders)
+        let title = nonemptyTitle(destination.title)
+        guard !title.isEmpty,
+              uniqueTitle(title, section: destination.section, folders: safeFolders) == title else {
+            throw StoreError.invalidWikiLink
+        }
+        return try createNote(section: destination.section, folders: safeFolders, title: title)
     }
 
     func updateMarkdown(id: UUID, markdown: String) {
@@ -627,21 +662,71 @@ final class StillStore {
             if let index = nextNotes.firstIndex(where: { $0.id == updated.id }) { nextNotes[index] = updated }
             else { nextNotes.append(updated) }
         }
-        var newlyWritten: [Note] = []
+
+        // A short link can resolve differently after either its source or its target
+        // moves. Resolve it against both snapshots and make only changed links stable.
+        // The alias remains byte-for-byte intact because only the target range changes.
+        for oldSource in notes {
+            guard let sourceIndex = nextNotes.firstIndex(where: { $0.id == oldSource.id }) else { continue }
+            let futureSource = nextNotes[sourceIndex]
+            var replacements: [(NSRange, String)] = []
+            for link in NoteLinks.links(in: oldSource.markdown) {
+                guard case let .resolved(oldTarget) = NoteLinks.resolution(target: link.target, from: oldSource, notes: notes),
+                      let futureTarget = nextNotes.first(where: { $0.id == oldTarget.id }) else { continue }
+                if case let .resolved(nextTarget) = NoteLinks.resolution(target: link.target, from: futureSource, notes: nextNotes),
+                   nextTarget.id == oldTarget.id {
+                    continue
+                }
+                replacements.append((link.targetRange, NoteLinks.target(for: futureTarget)))
+            }
+            guard !replacements.isEmpty else { continue }
+            var markdown = futureSource.markdown as NSString
+            for (range, replacement) in replacements.sorted(by: { $0.0.location > $1.0.location }) {
+                markdown = markdown.replacingCharacters(in: range, with: replacement) as NSString
+            }
+            nextNotes[sourceIndex].markdown = markdown as String
+            nextNotes[sourceIndex].updatedAt = .now
+        }
+
+        var orderedWriteIDs = updatedNotes.map(\.id)
+        orderedWriteIDs.append(contentsOf: notes.compactMap { old in
+            guard let next = nextNotes.first(where: { $0.id == old.id }), next.markdown != old.markdown else { return nil }
+            return old.id
+        })
+        var writtenIDs: Set<UUID> = []
+        let writeNotes = orderedWriteIDs.compactMap { id -> Note? in
+            guard writtenIDs.insert(id).inserted else { return nil }
+            return nextNotes.first(where: { $0.id == id })
+        }
+
+        // Keep the exact bytes at every destination path so a failed write or manifest
+        // save can restore all sources, including a source file whose path did not move.
+        var fileSnapshots: [(url: URL, existed: Bool, data: Data?)] = []
+        for note in writeNotes {
+            let url = relativeURL(for: note)
+            let existed = FileManager.default.fileExists(atPath: url.path)
+            let data = existed ? try Data(contentsOf: url) : nil
+            fileSnapshots.append((url, existed, data))
+        }
         do {
-            for updated in updatedNotes {
+            for updated in writeNotes {
                 try writeMarkdown(updated.markdown, for: updated)
-                newlyWritten.append(updated)
             }
             try saveManifest(notes: nextNotes, folders: folderOverride)
         } catch {
-            for updated in newlyWritten where !oldNotes.contains(where: { relativeURL(for: $0) == relativeURL(for: updated) }) {
-                try? removeMarkdown(for: updated)
+            for snapshot in fileSnapshots.reversed() {
+                if snapshot.existed, let data = snapshot.data {
+                    try? FileManager.default.createDirectory(at: snapshot.url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? data.write(to: snapshot.url, options: .atomic)
+                } else if FileManager.default.fileExists(atPath: snapshot.url.path) {
+                    try? FileManager.default.removeItem(at: snapshot.url)
+                }
             }
             throw error
         }
         notes = nextNotes
         if let folderOverride { folders = folderOverride }
+        dirtyNoteIDs.subtract(writtenIDs)
         for old in oldNotes where !updatedNotes.contains(where: { relativeURL(for: $0) == relativeURL(for: old) }) {
             try? removeMarkdown(for: old)
         }
@@ -683,6 +768,8 @@ enum StoreError: LocalizedError {
     case folderAlreadyExists
     case missingManifest
     case imageInsertFailed
+    case invalidWikiLink
+    case ambiguousWikiLink
 
     var errorDescription: String? {
         switch self {
@@ -695,6 +782,8 @@ enum StoreError: LocalizedError {
         case .folderAlreadyExists: L10n.text("error.folderAlreadyExists")
         case .missingManifest: L10n.text("error.missingManifest")
         case .imageInsertFailed: L10n.text("error.imageInsertFailed")
+        case .invalidWikiLink: L10n.text("error.invalidWikiLink")
+        case .ambiguousWikiLink: L10n.text("error.ambiguousWikiLink")
         }
     }
 }
