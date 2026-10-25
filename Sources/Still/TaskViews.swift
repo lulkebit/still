@@ -44,7 +44,7 @@ struct GlobalSearchBoard: View {
     }
 
     private var results: [Result] {
-        let notes = store.notes.filter { $0.title.localizedCaseInsensitiveContains(query) || $0.markdown.localizedCaseInsensitiveContains(query) }.map(Result.note)
+        let notes = store.visibleNotes.filter { $0.title.localizedCaseInsensitiveContains(query) || $0.markdown.localizedCaseInsensitiveContains(query) }.map(Result.note)
         let tasks = store.tasks.filter { $0.title.localizedCaseInsensitiveContains(query) || $0.detail.localizedCaseInsensitiveContains(query) }.map(Result.task)
         let embedded = store.embeddedTasks.filter { $0.title.localizedCaseInsensitiveContains(query) || $0.noteTitle.localizedCaseInsensitiveContains(query) }.map(Result.embedded)
         return (notes + tasks + embedded).sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
@@ -140,15 +140,19 @@ struct TaskBoardView: View {
                         .foregroundStyle(.secondary).help(L10n.text("task.add"))
                         .accessibilityIdentifier("new-task")
                     }
-                    .padding(.horizontal, 11).padding(.vertical, 6)
-                    .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.05), lineWidth: 0.5))
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .overlay(alignment: .bottom) {
+                        Rectangle().fill(Color.primary.opacity(0.09)).frame(height: 0.5).allowsHitTesting(false)
+                    }
                 }
 
-                VStack(alignment: .leading, spacing: 9) {
-                    sectionHeading("task.standalone", count: sortedTasks.count)
+                VStack(alignment: .leading, spacing: 0) {
+                    sectionHeading("task.standalone", count: sortedTasks.count).padding(.bottom, 5)
                     if sortedTasks.isEmpty {
-                        Text(L10n.text("task.empty")).font(.system(size: 12)).foregroundStyle(.tertiary).padding(.vertical, 7)
+                        Text(L10n.text("task.empty"))
+                            .font(.system(size: 12)).foregroundStyle(.tertiary).padding(.vertical, 7)
+                            .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
                     } else {
                         ForEach(sortedTasks) { task in
                             StandaloneTaskRow(task: task, appModel: appModel,
@@ -163,15 +167,18 @@ struct TaskBoardView: View {
 
                 let embedded = store.embeddedTasks.sorted { $0.noteTitle.localizedStandardCompare($1.noteTitle) == .orderedAscending }
                 VStack(alignment: .leading, spacing: 9) {
-                    sectionHeading("task.checklists", count: embedded.count)
+                    sectionHeading(store.wikiEnabled ? "task.checklists" : "task.checklists.notesOnly", count: embedded.count)
                     if embedded.isEmpty {
-                        Text(L10n.text("task.noChecklists")).font(.system(size: 12)).foregroundStyle(.tertiary).padding(.vertical, 7)
+                        Text(L10n.text(store.wikiEnabled ? "task.noChecklists" : "task.noChecklists.notesOnly"))
+                            .font(.system(size: 12)).foregroundStyle(.tertiary).padding(.vertical, 7)
                     } else {
                         ForEach(embedded) { item in
                             HStack(spacing: 10) {
                                 Button { store.toggleEmbeddedTask(item) } label: {
                                     Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
                                         .font(.system(size: 16)).foregroundStyle(item.isDone ? Color.accentColor : Color.secondary)
+                                        .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
+                                        .animation(reduceMotion ? nil : CalmMotion.quick, value: item.isDone)
                                 }
                                 .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
                                 .accessibilityLabel(L10n.text(item.isDone ? "task.reopen" : "task.complete"))
@@ -212,7 +219,9 @@ struct TaskBoardView: View {
 
     private func addTask() {
         do {
-            let task = try store.createTask(title: draftTitle)
+            let task = try withAnimation(reduceMotion ? nil : CalmMotion.standard) {
+                try store.createTask(title: draftTitle)
+            }
             selectedTaskID = task.id
             draftTitle = ""
         } catch { store.report(error) }
@@ -221,13 +230,17 @@ struct TaskBoardView: View {
     private func toggle(_ task: TaskItem) {
         var updated = task
         updated.status = task.status == .done ? .open : .done
-        withAnimation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.94)) {
+        withAnimation(reduceMotion ? nil : CalmMotion.quick) {
             do { try store.updateTask(updated) } catch { store.report(error) }
         }
     }
 
     private func delete(_ task: TaskItem) {
-        do { try store.deleteTask(id: task.id) }
+        do {
+            try withAnimation(reduceMotion ? nil : CalmMotion.standard) {
+                try store.deleteTask(id: task.id)
+            }
+        }
         catch { store.report(error) }
     }
 }
@@ -245,6 +258,7 @@ private struct StandaloneTaskRow: View {
     @State private var pendingAIOriginal: String?
     @State private var pendingAIRange: NSRange?
     @State private var titleDraft = ""
+    @State private var isRenaming = false
     @FocusState private var titleFocused: Bool
 
     var body: some View {
@@ -253,52 +267,62 @@ private struct StandaloneTaskRow: View {
                 Button(action: onToggle) {
                     Image(systemName: task.status == .done ? "checkmark.circle.fill" : "circle")
                         .font(.system(size: 16)).foregroundStyle(task.status == .done ? Color.accentColor : Color.secondary)
+                        .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
+                        .animation(reduceMotion ? nil : CalmMotion.quick, value: task.status)
                 }
-                .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
+                .buttonStyle(CalmButtonStyle()).pointerStyle(.link)
                 .accessibilityLabel(L10n.text(task.status == .done ? "task.reopen" : "task.complete"))
-                Button(action: onExpand) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Text(task.title).font(.system(size: 13, weight: .regular)).foregroundStyle(task.status == .done ? .secondary : .primary)
-                                .strikethrough(task.status == .done, color: .secondary).lineLimit(2)
-                            if task.status == .waiting {
-                                Text(L10n.text("task.status.waiting")).font(.system(size: 10)).foregroundStyle(.tertiary)
+                if isRenaming {
+                    TextField(L10n.text("task.titlePlaceholder"), text: $titleDraft)
+                        .textFieldStyle(.plain).font(.system(size: 13, weight: .regular))
+                        .focused($titleFocused).onSubmit(finishTitleEditing)
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .task(id: isRenaming) {
+                            guard isRenaming else { return }
+                            await Task.yield()
+                            guard !Task.isCancelled, isRenaming else { return }
+                            titleFocused = true
+                        }
+                        .onChange(of: titleFocused) { _, focused in
+                            if !focused && isRenaming { finishTitleEditing() }
+                        }
+                        .onChange(of: task.title) { _, value in
+                            if !titleFocused { titleDraft = value }
+                        }
+                        .accessibilityLabel(L10n.text("list.rename"))
+                        .accessibilityIdentifier("task-edit-title-\(task.id.uuidString)")
+                } else {
+                    Button(action: onExpand) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Text(task.title).font(.system(size: 13, weight: .regular)).foregroundStyle(task.status == .done ? .secondary : .primary)
+                                    .strikethrough(task.status == .done, color: .secondary).lineLimit(2)
+                                if task.status == .waiting {
+                                    Text(L10n.text("task.status.waiting")).font(.system(size: 10)).foregroundStyle(.tertiary)
+                                }
+                            }
+                            if task.dueDate != nil || task.priority == .high {
+                                HStack(spacing: 8) {
+                                    if let dueDate = task.dueDate { Text(dueDate, style: .date) }
+                                    if task.priority == .high { Label(L10n.text("task.priority.high"), systemImage: "flag.fill") }
+                                }.font(.system(size: 10)).foregroundStyle(.tertiary)
                             }
                         }
-                        if task.dueDate != nil || task.priority == .high {
-                            HStack(spacing: 8) {
-                                if let dueDate = task.dueDate { Text(dueDate, style: .date) }
-                                if task.priority == .high { Label(L10n.text("task.priority.high"), systemImage: "flag.fill") }
-                            }.font(.system(size: 10)).foregroundStyle(.tertiary)
-                        }
+                        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                        .contentShape(Rectangle())
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                    .buttonStyle(CalmButtonStyle()).pointerStyle(.link)
                 }
-                .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
-                Menu {
-                    Button(L10n.text("task.details"), systemImage: "slider.horizontal.3", action: onExpand)
-                    Divider()
-                    Button(L10n.text("task.delete"), systemImage: "trash", role: .destructive, action: onDelete)
-                } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 11)).foregroundStyle(.tertiary).frame(width: 24, height: 24)
-                }
-                .menuStyle(.borderlessButton).pointerStyle(.link).calmHover(cornerRadius: 6)
             }
-            .padding(.vertical, 8)
-            .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.05)).frame(height: 0.5) }
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 12) {
-                    TextField(L10n.text("task.titlePlaceholder"), text: $titleDraft)
-                        .textFieldStyle(.plain).font(.system(size: 12, weight: .medium))
-                        .focused($titleFocused).onSubmit(commitTitle)
-                        .onChange(of: titleFocused) { _, focused in if !focused { commitTitle() } }
-                        .onChange(of: task.title) { _, value in if !titleFocused { titleDraft = value } }
-                        .accessibilityIdentifier("task-edit-title-\(task.id.uuidString)")
                     TaskDescriptionTextView(
                         text: task.detail,
                         isBusy: isWikiBusy,
                         isAIEnabled: appModel.store.settings.enabled && !appModel.aiBusy,
+                        isWikiEnabled: appModel.store.wikiEnabled,
                         busySelectionRange: pendingAIRange,
                         busySourceText: pendingAIOriginal,
                         reduceMotion: reduceMotion,
@@ -306,18 +330,19 @@ private struct StandaloneTaskRow: View {
                         onAIAction: performAI
                     )
                         .frame(height: 100)
-                        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 7))
                         .accessibilityIdentifier("task-description-\(task.id.uuidString)")
                     HStack(spacing: 12) {
                         Picker(L10n.text("task.status"), selection: Binding(get: { task.status }, set: updateStatus)) {
                             ForEach(TaskStatus.allCases) { status in Text(L10n.text(status.localizationKey)).tag(status) }
                         }
-                        .labelsHidden().frame(width: 150).pointerStyle(.link).calmHover(cornerRadius: 6)
+                        .labelsHidden().pickerStyle(.menu).buttonStyle(.borderless).fixedSize().pointerStyle(.link)
+                        .accessibilityLabel(L10n.text("task.status"))
                         .accessibilityIdentifier("task-status")
                         Picker(L10n.text("task.priority"), selection: Binding(get: { task.priority }, set: updatePriority)) {
                             ForEach(TaskPriority.allCases) { priority in Text(L10n.text(priority.localizationKey)).tag(priority) }
                         }
-                        .labelsHidden().frame(width: 130).pointerStyle(.link).calmHover(cornerRadius: 6)
+                        .labelsHidden().pickerStyle(.menu).buttonStyle(.borderless).fixedSize().pointerStyle(.link)
+                        .accessibilityLabel(L10n.text("task.priority"))
                         .accessibilityIdentifier("task-priority")
                         if task.dueDate != nil {
                             DatePicker(L10n.text("task.dueDate"), selection: Binding(get: { task.dueDate ?? .now }, set: { updateDueDate($0) }), displayedComponents: .date)
@@ -336,12 +361,22 @@ private struct StandaloneTaskRow: View {
                     .font(.system(size: 11))
                     .controlSize(.small)
                 }
-                .padding(.leading, 26).padding(.top, 9).padding(.bottom, 13)
-                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
+                .padding(.leading, 25).padding(.top, 9).padding(.bottom, 13)
+                .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
                 .clipped()
             }
         }
-        .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.90), value: isExpanded)
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.primary.opacity(0.07)).frame(height: 0.5).allowsHitTesting(false)
+        }
+        .contextMenu {
+            Button(L10n.text("list.rename"), systemImage: "pencil", action: beginTitleEditing)
+            Button(L10n.text("task.delete"), systemImage: "trash", role: .destructive, action: onDelete)
+        }
+        .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
+        .animation(reduceMotion ? nil : CalmMotion.standard, value: isExpanded)
         .onAppear { titleDraft = task.title }
         .onChange(of: task.detail) { _, detail in
             if isWikiBusy && detail != pendingAIOriginal { finishAIAction() }
@@ -363,13 +398,24 @@ private struct StandaloneTaskRow: View {
         save(updated)
     }
 
+    private func beginTitleEditing() {
+        titleDraft = task.title
+        isRenaming = true
+    }
+
+    private func finishTitleEditing() {
+        commitTitle()
+        isRenaming = false
+    }
+
     private func updateStatus(_ value: TaskStatus) { var updated = task; updated.status = value; save(updated) }
     private func updatePriority(_ value: TaskPriority) { var updated = task; updated.priority = value; save(updated) }
     private func updateDueDate(_ value: Date?) { var updated = task; updated.dueDate = value; save(updated) }
     private func save(_ updated: TaskItem) { do { try appModel.store.updateTask(updated) } catch { appModel.store.report(error) } }
 
     private func performAI(_ action: String, selectedText: String, range: NSRange, applyReplacement: @escaping (String) -> Bool) {
-        guard !isWikiBusy, !appModel.aiBusy, appModel.store.settings.enabled else { return }
+        guard !isWikiBusy, !appModel.aiBusy, appModel.store.settings.enabled,
+              action != "wiki" || appModel.store.wikiEnabled else { return }
         let original = task.detail
         guard range.location >= 0, range.length > 0, NSMaxRange(range) <= (original as NSString).length else { return }
         let source = (original as NSString).substring(with: range)
@@ -423,6 +469,7 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
     var text: String
     var isBusy: Bool
     var isAIEnabled: Bool
+    var isWikiEnabled: Bool
     var busySelectionRange: NSRange?
     var busySourceText: String?
     var reduceMotion: Bool
@@ -451,7 +498,8 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
         view.allowsUndo = true
         view.isAutomaticQuoteSubstitutionEnabled = false
         view.isAutomaticDashSubstitutionEnabled = false
-        view.textContainerInset = NSSize(width: 9, height: 8)
+        view.textContainerInset = NSSize(width: 0, height: 8)
+        view.textContainer?.lineFragmentPadding = 0
         view.minSize = NSSize(width: 0, height: 0)
         view.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         view.isVerticallyResizable = true
@@ -460,6 +508,7 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
         view.textContainer?.widthTracksTextView = true
         view.string = text
         view.isAIEnabled = isAIEnabled
+        view.isWikiEnabled = isWikiEnabled
         view.setAIBusy(isBusy, selectionRange: busySelectionRange, sourceText: busySourceText, reduceMotion: reduceMotion)
         scroll.documentView = view
         context.coordinator.textView = view
@@ -474,6 +523,7 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
             coordinator?.onAIAction(action, selected, range, apply)
         }
         view.isAIEnabled = isAIEnabled
+        view.isWikiEnabled = isWikiEnabled
         if view.string != text, !view.hasMarkedText() {
             if isBusy && text != busySourceText {
                 view.setAIBusy(false, selectionRange: nil, sourceText: nil, reduceMotion: true)
@@ -515,6 +565,7 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
 final class TaskSelectionTextView: NSTextView {
     var onAIAction: ((String, String, NSRange, @escaping (String) -> Bool) -> Void)?
     var isAIEnabled = false
+    var isWikiEnabled = false
     private(set) var isAIBusy = false
     private var contextualSelection: (text: String, range: NSRange)?
     private var busySelectionRange: NSRange?
@@ -599,13 +650,15 @@ final class TaskSelectionTextView: NSTextView {
         let selected = range.length > 0 && NSMaxRange(range) <= (string as NSString).length
             ? (string as NSString).substring(with: range) : ""
         contextualSelection = selected.isEmpty ? nil : (selected, range)
-        let wiki = NSMenuItem(title: L10n.text("action.wiki"), action: #selector(createWikiFromSelection), keyEquivalent: "")
-        wiki.target = self
-        wiki.isEnabled = !selected.isEmpty && !isAIBusy && isAIEnabled
+        if isWikiEnabled {
+            let wiki = NSMenuItem(title: L10n.text("action.wiki"), action: #selector(createWikiFromSelection), keyEquivalent: "")
+            wiki.target = self
+            wiki.isEnabled = !selected.isEmpty && !isAIBusy && isAIEnabled
+            menu.addItem(wiki)
+        }
         let optimize = NSMenuItem(title: L10n.text("action.optimize"), action: #selector(optimizeSelection), keyEquivalent: "")
         optimize.target = self
         optimize.isEnabled = !selected.isEmpty && !isAIBusy && isAIEnabled
-        menu.addItem(wiki)
         menu.addItem(optimize)
         if let native = super.menu(for: event), !native.items.isEmpty {
             menu.addItem(.separator())
@@ -620,7 +673,7 @@ final class TaskSelectionTextView: NSTextView {
     @objc private func optimizeSelection() { perform("optimize") }
 
     private func perform(_ action: String) {
-        guard !isAIBusy, isAIEnabled else { return }
+        guard !isAIBusy, isAIEnabled, action != "wiki" || isWikiEnabled else { return }
         let selectionValue = contextualSelection ?? {
             let range = selectedRange()
             guard range.length > 0, NSMaxRange(range) <= (string as NSString).length else { return nil }

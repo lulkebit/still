@@ -8,6 +8,15 @@ private enum FolderAction {
     case trash(Folder)
 }
 
+private enum SidebarRowLayout {
+    static let height: CGFloat = 24
+    static let horizontalInset: CGFloat = 7
+    static let iconWidth: CGFloat = 12
+    static let disclosureWidth: CGFloat = 10
+    static let actionWidth: CGFloat = 12
+    static let depth: CGFloat = 13
+}
+
 private enum StatusBannerSource: Hashable {
     case loadError
     case storeError
@@ -18,6 +27,21 @@ private enum StatusBannerSource: Hashable {
 private struct StatusBannerSnapshot: Hashable {
     let source: StatusBannerSource
     let message: String
+}
+
+private enum WorkspaceRoute: Hashable {
+    case search
+    case tasks
+    case document
+    case chat
+    case trash
+}
+
+private enum SidebarContentRoute: Hashable {
+    case folders
+    case chats
+    case trash
+    case empty
 }
 
 private enum SheetRoute: Identifiable {
@@ -63,7 +87,7 @@ struct ContentView: View {
     let noteNavigation: NoteNavigationHistory
 
     private var store: StillStore { appModel.store }
-    private var selectedNote: Note? { store.notes.first(where: { $0.id == selectedNoteID }) }
+    private var selectedNote: Note? { store.visibleNotes.first(where: { $0.id == selectedNoteID }) }
     private var currentNoteSection: NoteSection { activeSection == .wiki ? .wiki : .notes }
 
     var body: some View {
@@ -79,9 +103,11 @@ struct ContentView: View {
         }
         .background(WindowConfigurator(reduceTransparency: reduceTransparency).frame(width: 0, height: 0))
         .frame(minWidth: 960, minHeight: 640)
-        .overlay(alignment: .top) { statusBanner }
+        .overlay(alignment: .top) {
+            statusBanner.animation(reduceMotion ? nil : CalmMotion.standard, value: visibleStatusBanner)
+        }
         .onAppear {
-            noteNavigation.updateNotes(store.notes)
+            noteNavigation.updateNotes(store.visibleNotes)
             restoreLastNote()
         }
         .onReceive(NotificationCenter.default.publisher(for: .stillNavigateBack)) { _ in navigateBack() }
@@ -93,30 +119,46 @@ struct ContentView: View {
                 focusSearchWhenVisible = true
                 return
             }
-            withAnimation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.94)) {
-                isSidebarVisible = true
-            }
+            setSidebarVisibilityImmediately(true)
             focusSearchWhenVisible = true
         }
         .onChange(of: selectedNoteID) { _, id in store.setLastOpenedNote(id) }
         .onChange(of: folderPath) { _, path in
-            guard !showTrash, activeSection != .tasks else { return }
+            guard !showTrash, activeSection != .tasks, activeSection != .chat else { return }
             if let selectedNote, selectedNote.section == currentNoteSection, selectedNote.folders == path { return }
             let nextID = store.notes(in: currentNoteSection, folderPath: path).first?.id
             noteNavigation.record(from: selectedNoteID, to: nextID)
             selectedNoteID = nextID
         }
-        .onChange(of: store.notes) { _, newNotes in
-            noteNavigation.updateNotes(newNotes)
-            repairSelection(after: newNotes)
+        .onChange(of: store.notes) { _, _ in
+            noteNavigation.updateNotes(store.visibleNotes)
+            repairSelection(after: store.visibleNotes)
+        }
+        .onChange(of: store.wikiEnabled) { _, enabled in
+            noteNavigation.updateNotes(store.visibleNotes)
+            guard !enabled else { return }
+            if activeSection == .wiki || (activeSection != .chat && selectedNote.map({ !store.canAccess($0.section) }) == true) {
+                showTrash = false
+                activeSection = .notes
+                folderPath = []
+                let nextNote = store.notes(in: .notes).first
+                noteNavigation.record(from: selectedNoteID, to: nextNote?.id)
+                selectedNoteID = nextNote?.id
+            }
+            if showTrash, selectedTrashID.flatMap({ id in store.trash.first(where: { $0.id == id })?.section }) == .wiki {
+                selectedTrashID = store.visibleTrash.first?.id
+            }
         }
         .onChange(of: showTrash) { _, isTrash in
-            if isTrash { selectedTrashID = store.trash.first?.id }
+            if isTrash { selectedTrashID = store.visibleTrash.first?.id }
         }
         .onChange(of: statusBannerSources) { _, sources in
             dismissedStatusBanners.formIntersection(Set(sources))
         }
-        .sheet(isPresented: $showSettings) { AISettingsView(appModel: appModel) }
+        .sheet(isPresented: $showSettings) {
+            AISettingsView(appModel: appModel)
+                .presentationBackground(.clear)
+        }
         .sheet(item: $sheetRoute, content: sheetContent)
         .confirmationDialog(
             L10n.text("dialog.deleteFolderTitle"),
@@ -170,8 +212,12 @@ struct ContentView: View {
                         query: $query,
                         focusSearchWhenVisible: $focusSearchWhenVisible,
                         store: store,
+                        chatStore: appModel.chatStore,
+                        chat: appModel.chat,
                         onToggleSidebar: toggleSidebarFromButton,
                         onSelectSection: selectSection,
+                        onNewChat: createChat,
+                        onSelectConversation: selectChatConversation,
                         onOpenNote: openNote,
                         onOpenTrashItem: { selectedTrashID = $0.id },
                         onRestoreTrash: restoreTrashItem,
@@ -183,7 +229,7 @@ struct ContentView: View {
                         onOpenSettings: { showSettings = true },
                         onFolderAction: handleFolderAction
                     )
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+                    .transition(reduceMotion ? .identity : .move(edge: .leading).combined(with: .opacity))
                 }
                 workspaceContent
             }
@@ -191,11 +237,11 @@ struct ContentView: View {
                 sidebarToggleButton
                     .padding(.leading, 12)
                     .padding(.top, 12)
-                    .transition(.opacity)
+                    .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
                     .zIndex(2)
             }
         }
-        .animation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.94), value: isSidebarVisible)
+        .animation(reduceMotion ? nil : CalmMotion.standard, value: isSidebarVisible)
     }
 
     private var sidebarToggleButton: some View {
@@ -204,7 +250,6 @@ struct ContentView: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: 28, height: 28)
-                .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 7))
                 .contentShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 7)
@@ -213,41 +258,54 @@ struct ContentView: View {
         .accessibilityIdentifier("show-sidebar")
     }
 
-    @ViewBuilder
-    private var workspaceContent: some View {
-        if !showTrash && !query.isEmpty {
-            GlobalSearchBoard(
-                store: store,
-                query: query,
-                onOpenNote: openNote,
-                onOpenTask: openTask,
-                onOpenEmbeddedTask: { openNote(id: $0.noteID) }
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if activeSection == .tasks && !showTrash {
-            TaskBoardView(appModel: appModel, query: query, selectedTaskID: $selectedTaskID, onOpenNote: openNote)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            documentDetail
+    private var workspaceRoute: WorkspaceRoute {
+        if showTrash { return .trash }
+        if !query.isEmpty { return .search }
+        switch activeSection {
+        case .tasks: return .tasks
+        case .chat: return .chat
+        case .notes, .wiki: return .document
         }
     }
 
-    @ViewBuilder
-    private var documentDetail: some View {
-        if showTrash {
-            TrashDetailView(entry: store.trash.first(where: { $0.id == selectedTrashID }), onRestore: restoreTrashItem)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
-            MainDocumentView(note: selectedNote, breadcrumb: breadcrumb, appModel: appModel,
-                             commands: commandBus, reduceMotion: reduceMotion,
-                             canNavigateBack: noteNavigation.canGoBack,
-                             onNavigateBack: navigateBack,
-                             onOpenNote: { openNote(id: $0) },
-                             onWikiCreated: { openNote(id: $0.id) },
-                             onOpenWikiLink: openWikiLink,
+    private var workspaceContent: some View {
+        ZStack(alignment: .topLeading) {
+            Group {
+                switch workspaceRoute {
+                case .search:
+                    GlobalSearchBoard(
+                        store: store,
+                        query: query,
+                        onOpenNote: openNote,
+                        onOpenTask: openTask,
+                        onOpenEmbeddedTask: { openNote(id: $0.noteID) }
+                    )
+                case .tasks:
+                    TaskBoardView(appModel: appModel, query: query, selectedTaskID: $selectedTaskID, onOpenNote: openNote)
+                case .document:
+                    MainDocumentView(note: selectedNote, breadcrumb: breadcrumb, appModel: appModel,
+                                     commands: commandBus, reduceMotion: reduceMotion,
+                                     canNavigateBack: noteNavigation.canGoBack,
+                                     onNavigateBack: navigateBack,
+                                     onOpenNote: { openNote(id: $0) },
+                                     onWikiCreated: { openNote(id: $0.id) },
+                                     onOpenWikiLink: openWikiLink,
+                                     onOpenExternalLink: openExternalLink)
+                case .chat:
+                    ChatView(appModel: appModel,
+                             onOpenSettings: { showSettings = true },
+                             onOpenSource: openChatSource,
                              onOpenExternalLink: openExternalLink)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case .trash:
+                    TrashDetailView(entry: store.visibleTrash.first(where: { $0.id == selectedTrashID }), onRestore: restoreTrashItem)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .id(workspaceRoute)
+            .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(reduceMotion ? nil : CalmMotion.standard, value: workspaceRoute)
     }
 
     private var breadcrumb: String {
@@ -291,7 +349,8 @@ struct ContentView: View {
             .overlay(Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
             .padding(.top, 14)
             .frame(maxWidth: 620)
-            .transition(.move(edge: .top).combined(with: .opacity))
+            .id(banner)
+            .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
             .zIndex(3)
             .task(id: banner) {
                 do {
@@ -300,7 +359,7 @@ struct ContentView: View {
                     return
                 }
                 guard visibleStatusBanner == banner else { return }
-                withAnimation(reduceMotion ? nil : .easeIn(duration: 0.16)) {
+                withAnimation(reduceMotion ? nil : CalmMotion.standard) {
                     dismissedStatusBanners.formUnion([banner])
                 }
             }
@@ -340,7 +399,7 @@ struct ContentView: View {
 
     private func restoreLastNote() {
         guard store.loadError == nil else { return }
-        let note = store.notes.first(where: { $0.id == store.lastOpenedNoteID }) ?? store.notes.sorted { $0.updatedAt > $1.updatedAt }.first
+        let note = store.visibleNotes.first(where: { $0.id == store.lastOpenedNoteID }) ?? store.visibleNotes.sorted { $0.updatedAt > $1.updatedAt }.first
         if let note {
             activeSection = note.section == .wiki ? .wiki : .notes
             folderPath = note.folders
@@ -357,11 +416,13 @@ struct ContentView: View {
     }
 
     private func selectSection(_ section: WorkspaceSection) {
-        withAnimation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.94)) {
+        if section == .wiki, !store.wikiEnabled { return }
+        withAnimation(reduceMotion ? nil : CalmMotion.standard) {
             showTrash = false
             activeSection = section
             folderPath = []
-            if section != .tasks {
+            if section == .chat { query = "" }
+            if section == .notes || section == .wiki {
                 let noteSection: NoteSection = section == .wiki ? .wiki : .notes
                 let note = store.notes(in: noteSection).first
                 noteNavigation.record(from: selectedNoteID, to: note?.id)
@@ -370,8 +431,34 @@ struct ContentView: View {
         }
     }
 
+    private func createChat() {
+        showTrash = false
+        query = ""
+        activeSection = .chat
+        folderPath = []
+        appModel.chat.newConversation()
+    }
+
+    private func selectChatConversation(_ id: UUID) {
+        showTrash = false
+        query = ""
+        activeSection = .chat
+        appModel.chat.selectConversation(id)
+    }
+
+    private func openChatSource(_ source: ChatSource) {
+        if let noteID = source.noteID {
+            guard let note = store.visibleNotes.first(where: { $0.id == noteID }),
+                  store.canAccess(note.section) else { return }
+            openNote(id: note.id)
+            return
+        }
+        guard let url = source.url.flatMap(ChatLinkPolicy.externalURL) else { return }
+        openExternalLink(url)
+    }
+
     private func toggleSidebarFromButton() {
-        withAnimation(reduceMotion ? nil : .spring(response: 0.22, dampingFraction: 0.94)) {
+        withAnimation(reduceMotion ? nil : CalmMotion.standard) {
             isSidebarVisible.toggle()
         }
     }
@@ -380,7 +467,15 @@ struct ContentView: View {
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastSidebarShortcutTime > 0.18 else { return }
         lastSidebarShortcutTime = now
-        toggleSidebarFromButton()
+        setSidebarVisibilityImmediately(!isSidebarVisible)
+    }
+
+    private func setSidebarVisibilityImmediately(_ isVisible: Bool) {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isSidebarVisible = isVisible
+        }
     }
 
     private func createNote() {
@@ -391,12 +486,13 @@ struct ContentView: View {
     }
 
     private func openNote(id: UUID) {
-        guard let note = store.notes.first(where: { $0.id == id }) else { return }
+        guard let note = store.visibleNotes.first(where: { $0.id == id }) else { return }
         noteNavigation.record(from: selectedNoteID, to: note.id)
         openNoteWithoutRecording(note)
     }
 
     private func openNoteWithoutRecording(_ note: Note) {
+        guard store.canAccess(note.section), store.visibleNotes.contains(where: { $0.id == note.id }) else { return }
         showTrash = false
         query = ""
         activeSection = note.section == .wiki ? .wiki : .notes
@@ -407,18 +503,23 @@ struct ContentView: View {
 
     private func navigateBack() {
         guard let id = noteNavigation.popPrevious(),
-              let note = store.notes.first(where: { $0.id == id }) else { return }
-        openNoteWithoutRecording(note)
+              let note = store.visibleNotes.first(where: { $0.id == id }) else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            openNoteWithoutRecording(note)
+        }
     }
 
     private func openWikiLink(_ request: WikiLinkRequest) {
         guard selectedNoteID == request.id,
-              let source = store.notes.first(where: { $0.id == request.id }),
+              let source = store.visibleNotes.first(where: { $0.id == request.id }),
               EditorLinkRequestPolicy.isCurrent(request, currentDocumentID: selectedNoteID, markdown: source.markdown) else { return }
-        switch NoteLinks.resolution(target: request.target, from: source, notes: store.notes) {
+        switch NoteLinks.resolution(target: request.target, from: source, notes: store.visibleNotes) {
         case let .resolved(note):
             openNote(id: note.id)
         case .missing:
+            guard let destination = NoteLinks.destination(for: request.target, from: source), store.canAccess(destination.section) else { return }
             pendingWikiLink = request
             showingMissingWikiLink = true
         case .ambiguous:
@@ -432,12 +533,13 @@ struct ContentView: View {
         defer { pendingWikiLink = nil }
         guard let request = pendingWikiLink,
               selectedNoteID == request.id,
-              let source = store.notes.first(where: { $0.id == request.id }),
+              let source = store.visibleNotes.first(where: { $0.id == request.id }),
               EditorLinkRequestPolicy.isCurrent(request, currentDocumentID: selectedNoteID, markdown: source.markdown) else { return }
-        switch NoteLinks.resolution(target: request.target, from: source, notes: store.notes) {
+        switch NoteLinks.resolution(target: request.target, from: source, notes: store.visibleNotes) {
         case let .resolved(note):
             openNote(id: note.id)
         case .missing:
+            guard let destination = NoteLinks.destination(for: request.target, from: source), store.canAccess(destination.section) else { return }
             do { openNote(id: try store.createLinkedNote(target: request.target, from: source).id) }
             catch { store.report(error) }
         case .ambiguous:
@@ -449,7 +551,7 @@ struct ContentView: View {
 
     private var missingWikiLinkDetails: String {
         guard let request = pendingWikiLink,
-              let source = store.notes.first(where: { $0.id == request.id }),
+              let source = store.visibleNotes.first(where: { $0.id == request.id }),
               let destination = NoteLinks.destination(for: request.target, from: source) else {
             return pendingWikiLink?.target ?? ""
         }
@@ -470,6 +572,8 @@ struct ContentView: View {
     }
 
     private func moveNote(id: UUID, section: NoteSection, path: [String]) {
+        guard store.canAccess(section),
+              let note = store.visibleNotes.first(where: { $0.id == id }), store.canAccess(note.section) else { return }
         do {
             try store.moveNote(id: id, section: section, folders: path)
             if selectedNoteID == id {
@@ -503,7 +607,7 @@ struct ContentView: View {
             try store.trashFolder(folder)
             if folderPath.starts(with: folder.path) { folderPath = Array(folder.path.dropLast()) }
             showTrash = true
-            selectedTrashID = store.trash.first?.id
+            selectedTrashID = store.visibleTrash.first?.id
         } catch { store.report(error) }
         folderToTrash = nil
     }
@@ -520,7 +624,7 @@ struct ContentView: View {
     private func restoreTrashItem(_ entry: TrashEntry) {
         do {
             try store.restoreTrashItem(id: entry.id)
-            if let restored = store.notes.first(where: { $0.id == entry.id }) {
+            if let restored = store.visibleNotes.first(where: { $0.id == entry.id }) {
                 openNote(id: restored.id)
             }
         } catch { store.report(error) }
@@ -529,6 +633,7 @@ struct ContentView: View {
 
 private struct NavigationSidebar: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Namespace private var sectionSelectionNamespace
     @Binding var activeSection: WorkspaceSection
     @Binding var folderPath: [String]
     @Binding var showTrash: Bool
@@ -538,8 +643,12 @@ private struct NavigationSidebar: View {
     @Binding var query: String
     @Binding var focusSearchWhenVisible: Bool
     let store: StillStore
+    let chatStore: ChatStore
+    let chat: ChatCoordinator
     let onToggleSidebar: () -> Void
     let onSelectSection: (WorkspaceSection) -> Void
+    let onNewChat: () -> Void
+    let onSelectConversation: (UUID) -> Void
     let onOpenNote: (UUID) -> Void
     let onOpenTrashItem: (TrashEntry) -> Void
     let onRestoreTrash: (TrashEntry) -> Void
@@ -565,7 +674,7 @@ private struct NavigationSidebar: View {
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
                         .frame(width: 27, height: 27)
-                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 7))
+                        .contentShape(RoundedRectangle(cornerRadius: 7))
                 }
                 .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover()
                 .help(L10n.text("sidebar.hide"))
@@ -582,94 +691,71 @@ private struct NavigationSidebar: View {
                     .textFieldStyle(.plain)
                     .font(.system(size: 12))
                     .focused($searchFocused)
-                    .accessibilityLabel(L10n.text("sidebar.searchAccessible"))
+                    .accessibilityLabel(L10n.text(store.wikiEnabled ? "sidebar.searchAccessible" : "sidebar.searchAccessible.noWiki"))
                     .accessibilityIdentifier("global-search")
                 if !query.isEmpty {
                     Button { query = "" } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundStyle(.tertiary) }
                         .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
                         .accessibilityLabel(L10n.text("action.clearSearch"))
+                        .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
                 }
             }
             .padding(.horizontal, 10).padding(.vertical, 8)
-            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.045), lineWidth: 0.5))
+            .background(searchFocused ? Color.primary.opacity(0.035) : .clear, in: RoundedRectangle(cornerRadius: 8))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(searchFocused ? Color.accentColor.opacity(0.35) : .clear, lineWidth: searchFocused ? 1 : 0)
+            }
             .padding(.bottom, 20)
+            .animation(reduceMotion ? nil : CalmMotion.quick, value: query.isEmpty)
+            .animation(reduceMotion ? nil : CalmMotion.quick, value: searchFocused)
 
             VStack(spacing: 3) {
-                ForEach([WorkspaceSection.tasks, .notes, .wiki]) { section in
+                ForEach(([WorkspaceSection.tasks, .notes] + (store.wikiEnabled ? [.wiki] : []) + [.chat])) { section in
+                    let isSelected = activeSection == section && !showTrash
                     Button { onSelectSection(section) } label: {
                         HStack(spacing: 10) {
                             Image(systemName: icon(for: section)).font(.system(size: 14, weight: .regular)).frame(width: 17)
-                            Text(L10n.text(section.localizationKey)).font(.system(size: 13, weight: activeSection == section && !showTrash ? .medium : .regular))
+                            Text(L10n.text(section.localizationKey)).font(.system(size: 13, weight: isSelected ? .medium : .regular))
                             Spacer()
                         }
-                        .foregroundStyle(activeSection == section && !showTrash ? Color.primary : Color.secondary)
+                        .foregroundStyle(isSelected ? Color.primary : Color.secondary)
                         .padding(.horizontal, 10).padding(.vertical, 8)
-                        .background(activeSection == section && !showTrash ? Color.primary.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 7))
+                        .background {
+                            if isSelected {
+                                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    .fill(Color.primary.opacity(0.07))
+                                    .overlay {
+                                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                            .stroke(Color.primary.opacity(0.08), lineWidth: 0.6)
+                                    }
+                                    .matchedGeometryEffect(id: "workspace-section-selection", in: sectionSelectionNamespace)
+                            }
+                        }
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 7)
                     .accessibilityIdentifier("nav-\(section.rawValue)")
                 }
             }
+            .animation(reduceMotion ? nil : CalmMotion.standard, value: activeSection)
+            .animation(reduceMotion ? nil : CalmMotion.standard, value: showTrash)
 
-            if showTrash {
-                ScrollView {
-                    LazyVStack(spacing: 2) {
-                        if store.trash.isEmpty { EmptyListLabel(text: L10n.text("list.empty")) }
-                        ForEach(store.trash) { entry in
-                            TrashRow(entry: entry, isSelected: selectedTrashID == entry.id,
-                                     onSelect: { onOpenTrashItem(entry) },
-                                     onRestore: { onRestoreTrash(entry) })
-                        }
-                    }
-                    .padding(.horizontal, 2)
-                }
-                .padding(.top, 20)
-            } else if activeSection != .tasks {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(L10n.text("sidebar.folders").uppercased())
-                        .font(.system(size: 10, weight: .medium))
-                        .tracking(0.8)
-                        .foregroundStyle(.tertiary)
-                        .padding(.leading, 10)
-                    Spacer()
-                    Button(action: onCreateNote) {
-                        Image(systemName: "plus").font(.system(size: 11, weight: .medium)).frame(width: 22, height: 22)
-                    }
-                    .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
-                    .help(L10n.text("list.newNote"))
-                    .accessibilityLabel(L10n.text("list.newNote"))
-                    .accessibilityIdentifier("new-note")
-                    Button(action: onCreateFolder) {
-                        Image(systemName: "folder.badge.plus").font(.system(size: 11)).frame(width: 22, height: 22)
-                    }
-                    .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
-                    .help(L10n.text("list.newFolder"))
-                    .accessibilityLabel(L10n.text("list.newFolder"))
-                    .accessibilityIdentifier("new-folder")
-                }
-                .foregroundStyle(.secondary)
-                .padding(.top, 22).padding(.bottom, 7).padding(.trailing, 4)
-
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        rootFolderNode
-                    }
-                    .padding(.bottom, 8)
-                }
-            }
+            sidebarContent
 
             Spacer(minLength: 10)
             VStack(spacing: 3) {
                 Button {
-                    showTrash.toggle()
-                    if showTrash { query = "" }
+                    withAnimation(reduceMotion ? nil : CalmMotion.standard) {
+                        showTrash.toggle()
+                        if showTrash { query = "" }
+                    }
                 } label: {
                     Label(L10n.text("nav.trash"), systemImage: "trash")
                         .font(.system(size: 12)).foregroundStyle(showTrash ? Color.primary : Color.secondary)
                         .padding(.horizontal, 10).padding(.vertical, 8).frame(maxWidth: .infinity, alignment: .leading)
                         .background(showTrash ? Color.primary.opacity(0.07) : .clear, in: RoundedRectangle(cornerRadius: 7))
+                        .animation(reduceMotion ? nil : CalmMotion.quick, value: showTrash)
                 }
                 .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 7)
                 .accessibilityIdentifier("nav-trash")
@@ -687,86 +773,123 @@ private struct NavigationSidebar: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .frame(width: 208)
         .overlay(alignment: .trailing) { Rectangle().fill(Color.primary.opacity(0.045)).frame(width: 1) }
-        .onChange(of: focusSearchWhenVisible) { _, shouldFocus in
-            guard shouldFocus else { return }
+        .task(id: focusSearchWhenVisible) {
+            guard focusSearchWhenVisible else { return }
+            await Task.yield()
+            guard !Task.isCancelled, focusSearchWhenVisible else { return }
             searchFocused = true
             focusSearchWhenVisible = false
         }
-        .onAppear {
-            if focusSearchWhenVisible {
-                searchFocused = true
-                focusSearchWhenVisible = false
+    }
+
+    private var sidebarContentRoute: SidebarContentRoute {
+        if showTrash { return .trash }
+        if activeSection == .chat { return .chats }
+        if activeSection == .tasks { return .empty }
+        return .folders
+    }
+
+    @ViewBuilder
+    private var sidebarContent: some View {
+        ZStack(alignment: .topLeading) {
+            Group {
+                switch sidebarContentRoute {
+                case .trash:
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            if store.visibleTrash.isEmpty { EmptyListLabel(text: L10n.text("list.empty")) }
+                            ForEach(store.visibleTrash) { entry in
+                                TrashRow(entry: entry, isSelected: selectedTrashID == entry.id,
+                                         onSelect: { onOpenTrashItem(entry) },
+                                         onRestore: { onRestoreTrash(entry) })
+                            }
+                        }
+                        .padding(.horizontal, 2)
+                    }
+                    .padding(.top, 20)
+                case .chats:
+                    ChatSidebarContent(chatStore: chatStore, chat: chat,
+                                       onNewChat: onNewChat,
+                                       onSelectConversation: onSelectConversation)
+                case .folders:
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(L10n.text("sidebar.folders").uppercased())
+                                .font(.system(size: 10, weight: .medium))
+                                .tracking(0.8)
+                                .foregroundStyle(.tertiary)
+                                .padding(.leading, 10)
+                            Spacer()
+                            Button(action: onCreateNote) {
+                                Image(systemName: "plus").font(.system(size: 11, weight: .medium)).frame(width: 22, height: 22)
+                            }
+                            .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
+                            .help(L10n.text("list.newNote"))
+                            .accessibilityLabel(L10n.text("list.newNote"))
+                            .accessibilityIdentifier("new-note")
+                            Button(action: onCreateFolder) {
+                                Image(systemName: "folder.badge.plus").font(.system(size: 11)).frame(width: 22, height: 22)
+                            }
+                            .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
+                            .help(L10n.text("list.newFolder"))
+                            .accessibilityLabel(L10n.text("list.newFolder"))
+                            .accessibilityIdentifier("new-folder")
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 22).padding(.bottom, 7).padding(.trailing, 4)
+
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 2) {
+                                sectionItems
+                            }
+                            .padding(.bottom, 8)
+                        }
+                    }
+                case .empty:
+                    EmptyView()
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .id(sidebarContentRoute)
+            .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .animation(reduceMotion ? nil : CalmMotion.standard, value: sidebarContentRoute)
     }
 
     private var activeNoteSection: NoteSection { activeSection == .wiki ? .wiki : .notes }
-    private var rootFolderNode: some View {
-        let rootID = FolderDisclosureState.rootID(for: activeNoteSection)
-        let isExpanded = folderDisclosureState.isExpanded(rootID)
-        return VStack(alignment: .leading, spacing: 2) {
-            Button {
-                withAnimation(disclosureAnimation) {
-                    if !isExpanded { folderPath = [] }
-                    folderDisclosureState.toggle(rootID)
-                }
-            } label: {
-                HStack(spacing: 7) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.tertiary)
-                        .frame(width: 14, height: 26)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    Image(systemName: "tray.full").font(.system(size: 12)).frame(width: 15)
-                    Text(L10n.text(activeSection == .wiki ? "nav.wiki" : "nav.notes"))
-                        .font(.system(size: 12, weight: folderPath.isEmpty ? .medium : .regular))
-                    Spacer(minLength: 0)
-                }
-                .foregroundStyle(folderPath.isEmpty ? Color.primary : Color.secondary)
-                .padding(.horizontal, 9).padding(.vertical, 6)
-                .background(folderPath.isEmpty ? Color.primary.opacity(0.055) : .clear, in: RoundedRectangle(cornerRadius: 6))
-                .contentShape(Rectangle())
+    private var sectionItems: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(store.notes(in: activeNoteSection, folderPath: [])) { note in
+                SidebarNoteRow(note: note, isSelected: selectedNoteID == note.id, store: store,
+                               onOpen: { onOpenNote(note.id) }, onRename: { onRenameNote(note) },
+                               onMove: onMoveNote, onTrash: onTrashNote)
             }
-            .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
-            .accessibilityValue(L10n.text(isExpanded ? "action.collapse" : "action.expand"))
-            .accessibilityIdentifier("folder-root-\(activeSection.rawValue)")
-            if isExpanded {
-                ForEach(store.notes(in: activeNoteSection, folderPath: [])) { note in
-                    SidebarNoteRow(note: note, isSelected: selectedNoteID == note.id, store: store,
-                                   onOpen: { onOpenNote(note.id) }, onRename: { onRenameNote(note) },
-                                   onMove: onMoveNote, onTrash: onTrashNote)
-                        .padding(.leading, 16)
-                }
-                ForEach(store.childFolders(in: activeNoteSection, parentPath: [])) { folder in
-                    FolderTreeNode(
-                        folder: folder, store: store,
-                        selectedPath: $folderPath,
-                        selectedNoteID: $selectedNoteID,
-                        folderDisclosureState: $folderDisclosureState,
-                        onOpenNote: onOpenNote,
-                        onRenameNote: onRenameNote,
-                        onMoveNote: onMoveNote,
-                        onTrashNote: onTrashNote,
-                        onAction: onFolderAction,
-                        depth: 0
-                    )
-                }
+            ForEach(store.childFolders(in: activeNoteSection, parentPath: [])) { folder in
+                FolderTreeNode(
+                    folder: folder, store: store,
+                    selectedPath: $folderPath,
+                    selectedNoteID: $selectedNoteID,
+                    folderDisclosureState: $folderDisclosureState,
+                    onOpenNote: onOpenNote,
+                    onRenameNote: onRenameNote,
+                    onMoveNote: onMoveNote,
+                    onTrashNote: onTrashNote,
+                    onAction: onFolderAction,
+                    depth: 0
+                )
             }
         }
-        .animation(disclosureAnimation, value: isExpanded)
-    }
-
-    private var disclosureAnimation: Animation? {
-        reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.78)
     }
 
     private func icon(for section: WorkspaceSection) -> String {
-        switch section { case .notes: "note.text"; case .tasks: "checklist"; case .wiki: "books.vertical" }
+        switch section { case .notes: "note.text"; case .tasks: "checklist"; case .wiki: "books.vertical"; case .chat: "bubble.left.and.bubble.right" }
     }
 }
 
 private struct FolderTreeNode: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHovered = false
     let folder: Folder
     let store: StillStore
     @Binding var selectedPath: [String]
@@ -785,13 +908,13 @@ private struct FolderTreeNode: View {
     private var isSelected: Bool { selectedPath == folder.path }
     private var hasContents: Bool { !children.isEmpty || !notes.isEmpty }
     private var moveTargets: [[String]] {
-        [[]] + store.folders.filter { $0.section == folder.section && !$0.path.starts(with: folder.path) }
+        [[]] + store.visibleFolders.filter { $0.section == folder.section && !$0.path.starts(with: folder.path) }
             .map(\.path).sorted { $0.joined(separator: "/").localizedStandardCompare($1.joined(separator: "/")) == .orderedAscending }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            HStack(spacing: 2) {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 0) {
                 Button {
                     withAnimation(disclosureAnimation) {
                         if isExpanded {
@@ -802,21 +925,21 @@ private struct FolderTreeNode: View {
                         }
                     }
                 } label: {
-                    HStack(spacing: 7) {
+                    HStack(spacing: 5) {
                         Image(systemName: hasContents ? "chevron.right" : "circle.fill")
-                            .font(.system(size: hasContents ? 9 : 3, weight: .semibold))
+                            .font(.system(size: hasContents ? 8 : 3, weight: .semibold))
                             .foregroundStyle(.tertiary)
-                            .frame(width: 14, height: 26)
+                            .frame(width: SidebarRowLayout.disclosureWidth, height: SidebarRowLayout.height)
                             .rotationEffect(.degrees(isExpanded && hasContents ? 90 : 0))
-                        Image(systemName: "folder").font(.system(size: 12)).frame(width: 14)
-                        Text(folder.name).font(.system(size: 12)).lineLimit(1)
+                        Image(systemName: "folder").font(.system(size: 11)).frame(width: SidebarRowLayout.iconWidth)
+                        Text(folder.name).font(.system(size: 11)).lineLimit(1)
                         Spacer(minLength: 0)
                     }
                     .foregroundStyle(isSelected ? Color.primary : Color.secondary)
-                    .padding(.vertical, 5).padding(.trailing, 7)
+                    .frame(height: SidebarRowLayout.height)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
+                .buttonStyle(CalmButtonStyle()).pointerStyle(.link)
                 .accessibilityLabel(folder.name)
                 .accessibilityValue(hasContents ? L10n.text(isExpanded ? "action.collapse" : "action.expand") : "")
                 Menu {
@@ -829,14 +952,27 @@ private struct FolderTreeNode: View {
                     Divider()
                     Button(L10n.text("list.deleteFolder"), systemImage: "trash", role: .destructive) { onAction(.trash(folder)) }
                 } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 11)).foregroundStyle(.tertiary).frame(width: 22, height: 24)
+                    Image(systemName: "ellipsis").font(.system(size: 11)).foregroundStyle(.tertiary)
+                        .frame(width: SidebarRowLayout.actionWidth, height: SidebarRowLayout.height)
                 }
                 .menuStyle(.borderlessButton)
-                .pointerStyle(.link).calmHover(cornerRadius: 6)
+                .menuIndicator(.hidden)
+                .opacity(isHovered ? 1 : 0)
+                .pointerStyle(.link)
                 .accessibilityLabel(L10n.text("list.more"))
             }
-            .padding(.leading, CGFloat(depth) * 13)
-            .background(isSelected ? Color.primary.opacity(0.06) : .clear, in: RoundedRectangle(cornerRadius: 6))
+            .padding(.horizontal, SidebarRowLayout.horizontalInset)
+            .frame(height: SidebarRowLayout.height)
+            .padding(.leading, CGFloat(depth) * SidebarRowLayout.depth)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isSelected ? Color.primary.opacity(0.06) : (isHovered ? Color.primary.opacity(0.028) : .clear))
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+            .onHover { isHovered = $0 }
+            .animation(reduceMotion ? nil : CalmMotion.quick, value: isSelected)
+            .animation(reduceMotion ? nil : CalmMotion.quick, value: isHovered)
             .contextMenu {
                 Button(L10n.text("list.renameFolder"), systemImage: "pencil") { onAction(.rename(folder)) }
                 Menu(L10n.text("list.moveFolder"), systemImage: "folder") {
@@ -849,7 +985,7 @@ private struct FolderTreeNode: View {
                     SidebarNoteRow(note: note, isSelected: selectedNoteID == note.id, store: store,
                                    onOpen: { onOpenNote(note.id) }, onRename: { onRenameNote(note) },
                                    onMove: onMoveNote, onTrash: onTrashNote)
-                        .padding(.leading, CGFloat(depth + 1) * 13)
+                        .padding(.leading, CGFloat(depth + 1) * SidebarRowLayout.depth)
                 }
                 ForEach(children) { child in
                     FolderTreeNode(folder: child, store: store, selectedPath: $selectedPath,
@@ -870,11 +1006,13 @@ private struct FolderTreeNode: View {
     }
 
     private var disclosureAnimation: Animation? {
-        reduceMotion ? nil : .spring(response: 0.28, dampingFraction: 0.78)
+        reduceMotion ? nil : CalmMotion.standard
     }
 }
 
 private struct SidebarNoteRow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isHovered = false
     let note: Note
     let isSelected: Bool
     let store: StillStore
@@ -884,23 +1022,24 @@ private struct SidebarNoteRow: View {
     let onTrash: (UUID) -> Void
 
     private var moveTargets: [(NoteSection, [String])] {
-        [(NoteSection.notes, []), (NoteSection.wiki, [])] + store.folders.map { ($0.section, $0.path) }
+        [(NoteSection.notes, [])] + (store.wikiEnabled ? [(NoteSection.wiki, [])] : [])
+            + store.visibleFolders.map { ($0.section, $0.path) }
     }
 
     var body: some View {
-        HStack(spacing: 3) {
+        HStack(spacing: 0) {
             Button(action: onOpen) {
                 HStack(spacing: 7) {
-                    Image(systemName: "doc.text").font(.system(size: 10)).foregroundStyle(.tertiary).frame(width: 12)
+                    Image(systemName: "doc.text").font(.system(size: 10)).foregroundStyle(.tertiary)
+                        .frame(width: SidebarRowLayout.iconWidth)
                     Text(note.title).font(.system(size: 11, weight: isSelected ? .medium : .regular))
                         .foregroundStyle(isSelected ? Color.primary : Color.secondary).lineLimit(1)
                     Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 7).padding(.vertical, 5)
-                .background(isSelected ? Color.primary.opacity(0.055) : .clear, in: RoundedRectangle(cornerRadius: 5))
+                .frame(height: SidebarRowLayout.height)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 5)
+            .buttonStyle(CalmButtonStyle()).pointerStyle(.link)
             .accessibilityIdentifier("sidebar-note-\(note.id.uuidString)")
             Menu {
                 Button(L10n.text("list.rename"), systemImage: "pencil", action: onRename)
@@ -914,11 +1053,22 @@ private struct SidebarNoteRow: View {
                 Button(L10n.text("list.delete"), systemImage: "trash", role: .destructive) { onTrash(note.id) }
             } label: {
                 Image(systemName: "ellipsis").font(.system(size: 10)).foregroundStyle(.tertiary)
-                    .frame(width: 21, height: 23).contentShape(Rectangle())
+                    .frame(width: SidebarRowLayout.actionWidth, height: SidebarRowLayout.height).contentShape(Rectangle())
             }
-            .menuStyle(.borderlessButton).pointerStyle(.link).calmHover(cornerRadius: 6)
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).opacity(isHovered ? 1 : 0).pointerStyle(.link)
             .accessibilityLabel(L10n.text("list.more"))
         }
+        .padding(.horizontal, SidebarRowLayout.horizontalInset)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(height: SidebarRowLayout.height)
+        .background {
+            RoundedRectangle(cornerRadius: 5)
+                .fill(isSelected ? Color.primary.opacity(0.055) : (isHovered ? Color.primary.opacity(0.028) : .clear))
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 5))
+        .onHover { isHovered = $0 }
+        .animation(reduceMotion ? nil : CalmMotion.quick, value: isSelected)
+        .animation(reduceMotion ? nil : CalmMotion.quick, value: isHovered)
         .contextMenu {
             Button(L10n.text("list.rename"), systemImage: "pencil", action: onRename)
             Menu(L10n.text("list.move"), systemImage: "folder") {
@@ -938,6 +1088,7 @@ private struct SidebarNoteRow: View {
 }
 
 private struct TrashRow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let entry: TrashEntry
     let isSelected: Bool
     let onSelect: () -> Void
@@ -961,6 +1112,7 @@ private struct TrashRow: View {
         }
         .padding(.horizontal, 2)
         .background(isSelected ? Color.primary.opacity(0.075) : .clear, in: RoundedRectangle(cornerRadius: 7))
+        .animation(reduceMotion ? nil : CalmMotion.quick, value: isSelected)
     }
 }
 
@@ -1028,6 +1180,8 @@ private struct MainDocumentView: View {
                         .accessibilityLabel(L10n.text("nav.back"))
                         .accessibilityIdentifier("note-navigation-back")
                         Text(breadcrumb).font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary).lineLimit(1)
+                            .contentTransition(reduceMotion ? .identity : .opacity)
+                            .animation(reduceMotion ? nil : CalmMotion.quick, value: breadcrumb)
                         Spacer(minLength: 12)
                         Menu {
                             Button(L10n.text("action.insertTable"), systemImage: "tablecells") {

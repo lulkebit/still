@@ -9,6 +9,8 @@ final class StillStore {
     private(set) var tasks: [TaskItem] = []
     private(set) var trash: [TrashEntry] = []
     private(set) var settings: AISettings = .empty
+    private(set) var wikiEnabled = true
+    private(set) var confluenceSettings: ConfluenceSettings = .empty
     private(set) var lastOpenedNoteID: UUID?
     private(set) var dirtyNoteIDs: Set<UUID> = []
     private(set) var loadError: String?
@@ -44,8 +46,16 @@ final class StillStore {
 
     var attachmentDirectory: URL { rootURL.appendingPathComponent("attachments", isDirectory: true) }
 
+    var visibleNotes: [Note] { notes.filter { canAccess($0.section) } }
+    var visibleFolders: [Folder] { folders.filter { canAccess($0.section) } }
+    var visibleTrash: [TrashEntry] { trash.filter { canAccess($0.section) } }
+
+    func canAccess(_ section: NoteSection) -> Bool {
+        section != .wiki || wikiEnabled
+    }
+
     var embeddedTasks: [EmbeddedTask] {
-        notes.flatMap { note in
+        visibleNotes.flatMap { note in
             Self.taskLines(in: note.markdown).compactMap { index, line in
                 guard let match = Self.checkboxRegex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
                       let stateRange = Range(match.range(at: 1), in: line),
@@ -60,16 +70,19 @@ final class StillStore {
     }
 
     func notes(in section: NoteSection, folderPath: [String] = []) -> [Note] {
-        notes.filter { $0.section == section && $0.folders == folderPath }
+        guard canAccess(section) else { return [] }
+        return notes.filter { $0.section == section && $0.folders == folderPath }
             .sorted { $0.updatedAt > $1.updatedAt }
     }
 
     func resolveWikiLink(_ target: String, from source: Note) -> Note? {
-        NoteLinks.resolve(target: target, from: source, notes: notes)
+        guard canAccess(source.section) else { return nil }
+        return NoteLinks.resolve(target: target, from: source, notes: visibleNotes)
     }
 
     func backlinks(to note: Note) -> [Note] {
-        notes.filter { source in
+        guard canAccess(note.section) else { return [] }
+        return visibleNotes.filter { source in
             guard source.id != note.id else { return false }
             if backlinkTargets[source.id] == nil {
                 backlinkTargets[source.id] = Set(NoteLinks.links(in: source.markdown).compactMap {
@@ -81,18 +94,21 @@ final class StillStore {
     }
 
     func childFolders(in section: NoteSection, parentPath: [String]) -> [Folder] {
-        folders.filter {
+        guard canAccess(section) else { return [] }
+        return folders.filter {
             $0.section == section && $0.path.count == parentPath.count + 1 && $0.path.starts(with: parentPath)
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     func folderExists(section: NoteSection, path: [String]) -> Bool {
-        folders.contains { $0.section == section && Self.sameFolderPath($0.path, path) }
+        guard canAccess(section) else { return false }
+        return folders.contains { $0.section == section && Self.sameFolderPath($0.path, path) }
     }
 
     @discardableResult
     func createNote(section: NoteSection, folders targetFolders: [String] = [], title: String? = nil, markdown: String = "") throws -> Note {
         try ensureWritable()
+        try ensureFeatureAccess(section)
         let safeFolders = try PathSafety.normalizeFolderPath(targetFolders)
         let previousFolders = folders
         ensureFolders(section: section, path: safeFolders)
@@ -117,8 +133,11 @@ final class StillStore {
     @discardableResult
     func createLinkedNote(target: String, from source: Note) throws -> Note {
         try ensureWritable()
-        guard let currentSource = notes.first(where: { $0.id == source.id }) else { throw StoreError.invalidWikiLink }
-        switch NoteLinks.resolution(target: target, from: currentSource, notes: notes) {
+        try ensureFeatureAccess(source.section)
+        guard let currentSource = notes.first(where: { $0.id == source.id }), canAccess(currentSource.section) else {
+            throw StoreError.invalidWikiLink
+        }
+        switch NoteLinks.resolution(target: target, from: currentSource, notes: visibleNotes) {
         case let .resolved(note): return note
         case .ambiguous: throw StoreError.ambiguousWikiLink
         case .invalid: throw StoreError.invalidWikiLink
@@ -127,6 +146,7 @@ final class StillStore {
         guard let destination = NoteLinks.destination(for: target, from: currentSource) else {
             throw StoreError.invalidWikiLink
         }
+        try ensureFeatureAccess(destination.section)
         let safeFolders = try PathSafety.normalizeFolderPath(destination.folders)
         let title = nonemptyTitle(destination.title)
         guard !title.isEmpty,
@@ -137,7 +157,7 @@ final class StillStore {
     }
 
     func updateMarkdown(id: UUID, markdown: String) {
-        guard canWrite, let index = notes.firstIndex(where: { $0.id == id }) else { return }
+        guard canWrite, let index = notes.firstIndex(where: { $0.id == id }), canAccess(notes[index].section) else { return }
         var next = notes[index]
         guard next.markdown != markdown else { return }
         next.markdown = markdown
@@ -235,6 +255,7 @@ final class StillStore {
         try ensureWritable()
         guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
         let old = notes[index]
+        try ensureFeatureAccess(old.section)
         let wanted = nonemptyTitle(title)
         guard !wanted.isEmpty else { throw StoreError.emptyTitle }
         var updated = old
@@ -247,6 +268,8 @@ final class StillStore {
         try ensureWritable()
         guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
         let old = notes[index]
+        try ensureFeatureAccess(old.section)
+        try ensureFeatureAccess(section)
         let safeFolders = try PathSafety.normalizeFolderPath(targetFolders)
         let previousFolders = folders
         ensureFolders(section: section, path: safeFolders)
@@ -262,6 +285,7 @@ final class StillStore {
     func trashNote(id: UUID) throws {
         try ensureWritable()
         guard let note = notes.first(where: { $0.id == id }) else { return }
+        try ensureFeatureAccess(note.section)
         try writeTrashMarkdown(note)
         let entry = TrashEntry(
             id: note.id, title: note.title, section: note.section, folders: note.folders,
@@ -287,6 +311,7 @@ final class StillStore {
     func restoreTrashItem(id: UUID) throws {
         try ensureWritable()
         guard let entry = trash.first(where: { $0.id == id }) else { return }
+        try ensureFeatureAccess(entry.section)
         let source = Note(id: entry.id, title: entry.title, section: entry.section, folders: entry.folders,
                           markdown: try readTrashMarkdown(for: entry))
         let safeFolders = try PathSafety.normalizeFolderPath(source.folders)
@@ -304,6 +329,7 @@ final class StillStore {
 
     func createFolder(section: NoteSection, parentPath: [String], name: String) throws -> Folder {
         try ensureWritable()
+        try ensureFeatureAccess(section)
         let safeParent = try PathSafety.normalizeFolderPath(parentPath)
         let safeName = try PathSafety.folderComponent(name)
         var candidate = safeName
@@ -330,6 +356,7 @@ final class StillStore {
 
     func renameFolder(_ folder: Folder, name: String) throws {
         try ensureWritable()
+        try ensureFeatureAccess(folder.section)
         guard folder.path.last != nil else { return }
         let safeName = try PathSafety.folderComponent(name)
         let parent = Array(folder.path.dropLast())
@@ -341,6 +368,7 @@ final class StillStore {
 
     func moveFolder(_ folder: Folder, into parentPath: [String]) throws {
         try ensureWritable()
+        try ensureFeatureAccess(folder.section)
         let targetParent = try PathSafety.normalizeFolderPath(parentPath)
         guard !targetParent.starts(with: folder.path) else { throw PathSafetyError.invalidComponent }
         let target = targetParent + [folder.name]
@@ -351,6 +379,7 @@ final class StillStore {
 
     func trashFolder(_ folder: Folder) throws {
         try ensureWritable()
+        try ensureFeatureAccess(folder.section)
         let descendants = notes.filter { $0.section == folder.section && $0.folders.starts(with: folder.path) }
         var copiedToTrash: [UUID] = []
         do {
@@ -390,6 +419,7 @@ final class StillStore {
 
     func createWikiPages(_ pages: [GeneratedWikiPage]) throws -> [Note] {
         try ensureWritable()
+        try ensureFeatureAccess(.wiki)
         guard !pages.isEmpty else { throw StoreError.invalidGeneratedPages }
         let previousFolders = folders
         var created: [Note] = []
@@ -431,6 +461,7 @@ final class StillStore {
     }
 
     func setLastOpenedNote(_ id: UUID?) {
+        if let id, let note = notes.first(where: { $0.id == id }), !canAccess(note.section) { return }
         guard canWrite, lastOpenedNoteID != id else { return }
         let previous = lastOpenedNoteID
         do {
@@ -441,7 +472,7 @@ final class StillStore {
     }
 
     func toggleEmbeddedTask(_ task: EmbeddedTask) {
-        guard let note = notes.first(where: { $0.id == task.noteID }) else { return }
+        guard let note = notes.first(where: { $0.id == task.noteID }), canAccess(note.section) else { return }
         var lines = note.markdown.components(separatedBy: "\n")
         guard lines.indices.contains(task.lineIndex), lines[task.lineIndex] == task.line,
               let match = Self.checkboxRegex.firstMatch(in: task.line, range: NSRange(task.line.startIndex..., in: task.line)),
@@ -457,10 +488,39 @@ final class StillStore {
     func completeAllEmbeddedTasks() -> [EmbeddedTask] { embeddedTasks }
 
     func updateSettings(_ settings: AISettings) throws {
+        try updateAllSettings(ai: settings, wikiEnabled: wikiEnabled, confluenceSettings: confluenceSettings)
+    }
+
+    func updateFeatureSettings(wikiEnabled nextWikiEnabled: Bool, confluenceSettings nextConfluenceSettings: ConfluenceSettings) throws {
+        try updateAllSettings(ai: settings, wikiEnabled: nextWikiEnabled, confluenceSettings: nextConfluenceSettings)
+    }
+
+    func updateAllSettings(ai nextAISettings: AISettings, wikiEnabled nextWikiEnabled: Bool,
+                           confluenceSettings nextConfluenceSettings: ConfluenceSettings) throws {
         try ensureWritable()
-        let old = self.settings
-        self.settings = settings
-        do { try saveManifest() } catch { self.settings = old; throw error }
+        guard settings != nextAISettings || wikiEnabled != nextWikiEnabled || confluenceSettings != nextConfluenceSettings else { return }
+        let oldAISettings = settings
+        let oldWikiEnabled = wikiEnabled
+        let oldConfluenceSettings = confluenceSettings
+        let oldLastOpenedNoteID = lastOpenedNoteID
+        settings = nextAISettings
+        wikiEnabled = nextWikiEnabled
+        confluenceSettings = nextConfluenceSettings
+        if oldWikiEnabled && !nextWikiEnabled,
+           let lastOpenedNoteID,
+           notes.first(where: { $0.id == lastOpenedNoteID })?.section == .wiki {
+            self.lastOpenedNoteID = notes.filter { $0.section == .notes }.sorted { $0.updatedAt > $1.updatedAt }.first?.id
+        }
+        do {
+            try saveManifest()
+        } catch {
+            settings = oldAISettings
+            wikiEnabled = oldWikiEnabled
+            confluenceSettings = oldConfluenceSettings
+            lastOpenedNoteID = oldLastOpenedNoteID
+            throw error
+        }
+        if oldWikiEnabled != nextWikiEnabled { invalidateLinkCatalog() }
     }
 
     @discardableResult
@@ -560,6 +620,8 @@ final class StillStore {
             tasks = loaded.tasks
             trash = loaded.trash
             settings = loaded.settings
+            wikiEnabled = loaded.wikiEnabled
+            confluenceSettings = loaded.confluenceSettings
             lastOpenedNoteID = loaded.lastOpenedNoteID
         } else if hasExistingMarkdownFiles() {
             throw StoreError.missingManifest
@@ -569,6 +631,8 @@ final class StillStore {
             tasks = seed.tasks
             folders = seed.folders
             settings = .empty
+            wikiEnabled = true
+            confluenceSettings = .empty
             lastOpenedNoteID = notes.first?.id
             for note in notes { try writeMarkdown(note.markdown, for: note) }
             try saveManifest()
@@ -642,13 +706,19 @@ final class StillStore {
             tasks: tasks,
             trash: trashOverride ?? trash,
             settings: settings,
-            lastOpenedNoteID: lastOpenedNoteID
+            lastOpenedNoteID: lastOpenedNoteID,
+            wikiEnabled: wikiEnabled,
+            confluenceSettings: confluenceSettings
         )
     }
 
     private func ensureWritable() throws {
         guard canWrite else { throw StoreError.workspaceReadOnly }
         try flushWrites()
+    }
+
+    private func ensureFeatureAccess(_ section: NoteSection) throws {
+        guard canAccess(section) else { throw StoreError.wikiDisabled }
     }
 
     private func hasExistingMarkdownFiles() -> Bool {
@@ -860,6 +930,7 @@ enum StoreError: LocalizedError {
     case imageInsertFailed
     case invalidWikiLink
     case ambiguousWikiLink
+    case wikiDisabled
 
     var errorDescription: String? {
         switch self {
@@ -874,6 +945,7 @@ enum StoreError: LocalizedError {
         case .imageInsertFailed: L10n.text("error.imageInsertFailed")
         case .invalidWikiLink: L10n.text("error.invalidWikiLink")
         case .ambiguousWikiLink: L10n.text("error.ambiguousWikiLink")
+        case .wikiDisabled: L10n.text("error.wikiDisabled")
         }
     }
 }

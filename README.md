@@ -41,3 +41,15 @@ Type `[[Page title]]` to link a note or Wiki page; `[[Page title|label]]` displa
 ## License
 
 Copyright (C) 2026 Luke Schröter. `still` is licensed under the GNU General Public License, version 3 or (at your option) any later version; see [`LICENSE`](LICENSE). Third-party dependencies remain under their respective licenses; see the bundled [third-party notices](Sources/Still/Resources/Editor/THIRD_PARTY_NOTICES.txt).
+
+## Chat and knowledge sources
+
+Chat keeps multiple named conversations locally in `conversations.json` in the same workspace as notes. Streaming replies are saved periodically and flushed when the app becomes inactive or exits. Interrupted replies remain readable and can be retried without duplicating the question. Switching conversations keeps the request running; deleting its conversation, changing settings, or disabling AI cancels it. Chat history remains readable while AI is off.
+
+Chat uses the selected OpenAI-compatible model and endpoint. It can search and read currently visible local notes and Wiki pages. Disabling Wiki keeps its files but excludes them from navigation and new AI context. Conversation history may still contain previously generated answers and source titles. Read source contents are untrusted reference data; tool payloads and credentials are never stored in conversations. Requests use up to six tool rounds, 18,000 characters of knowledge per turn, and 60,000 characters of recent conversation history, preserving whole turns. Questions are limited to 30,000 characters.
+
+Confluence is optional. Configure an HTTPS Confluence Data Center base URL (including its context path, for example `https://wiki.example.org/confluence`) and a Personal Access Token in Settings. Loopback HTTP is supported for development. Tokens are stored in Keychain separately for each normalized instance. Disabling Confluence keeps its token; the explicit remove action deletes it. Connection testing verifies an authenticated current user. Only read-only search and current-page retrieval are available, with a maximum of ten search results. Redirects are refused so credentials cannot leave the configured instance.
+
+Confluence tools use the official MCP Swift SDK 0.12.1 with an in-process MCP server/client pair, initialization, tool discovery, and tool calls over `InMemoryTransport`. No external MCP service, Node.js, or Python is required at runtime. SwiftSoup 2.14.3 turns page HTML into bounded readable text. Textual 0.5.0 renders chat Markdown. Their licenses are included in [additional third-party notices](Sources/Still/Resources/THIRD_PARTY_NOTICES.txt).
+
+If the provider explicitly rejects streaming, Chat retries once without streaming. If it explicitly rejects tools, Chat continues as ordinary chat with a visible notice. It never selects another model automatically. Network failures or partial replies are not retried automatically.

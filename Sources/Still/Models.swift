@@ -4,6 +4,7 @@ enum WorkspaceSection: String, CaseIterable, Identifiable {
     case notes
     case tasks
     case wiki
+    case chat
 
     var id: String { rawValue }
     var localizationKey: String { "nav.\(rawValue)" }
@@ -119,6 +120,13 @@ struct AISettings: Codable, Equatable, Sendable {
     static let empty = AISettings(baseURL: "", model: "", enabled: false)
 }
 
+struct ConfluenceSettings: Codable, Equatable, Sendable {
+    var enabled: Bool
+    var baseURL: String
+
+    static let empty = ConfluenceSettings(enabled: false, baseURL: "")
+}
+
 struct NoteIndexEntry: Codable, Equatable, Sendable {
     var id: UUID
     var title: String
@@ -155,6 +163,8 @@ struct StoreManifest: Codable, Sendable {
     var trash: [TrashEntry]
     var settings: AISettings
     var lastOpenedNoteID: UUID?
+    var wikiEnabled: Bool = true
+    var confluenceSettings: ConfluenceSettings = .empty
 
     static let empty = StoreManifest(
         formatVersion: 1,
@@ -163,8 +173,30 @@ struct StoreManifest: Codable, Sendable {
         tasks: [],
         trash: [],
         settings: .empty,
-        lastOpenedNoteID: nil
+        lastOpenedNoteID: nil,
+        wikiEnabled: true,
+        confluenceSettings: .empty
     )
+}
+
+extension StoreManifest {
+    private enum CodingKeys: String, CodingKey {
+        case formatVersion, notes, folders, tasks, trash, settings, lastOpenedNoteID
+        case wikiEnabled, confluenceSettings
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try values.decode(Int.self, forKey: .formatVersion)
+        notes = try values.decode([NoteIndexEntry].self, forKey: .notes)
+        folders = try values.decode([Folder].self, forKey: .folders)
+        tasks = try values.decode([TaskItem].self, forKey: .tasks)
+        trash = try values.decode([TrashEntry].self, forKey: .trash)
+        settings = try values.decodeIfPresent(AISettings.self, forKey: .settings) ?? .empty
+        lastOpenedNoteID = try values.decodeIfPresent(UUID.self, forKey: .lastOpenedNoteID)
+        wikiEnabled = try values.decodeIfPresent(Bool.self, forKey: .wikiEnabled) ?? true
+        confluenceSettings = try values.decodeIfPresent(ConfluenceSettings.self, forKey: .confluenceSettings) ?? .empty
+    }
 }
 
 enum PathSafety {

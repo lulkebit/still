@@ -37,7 +37,10 @@ fi
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources"
 cp "$BIN_DIR/still" "$APP_PATH/Contents/MacOS/still"
-cp -R "$RESOURCE_BUNDLE" "$APP_PATH/Contents/Resources/Still_Still.bundle"
+# SwiftPM dependencies (including Textual/Math) can own additional resource bundles.
+while IFS= read -r -d '' bundle; do
+  cp -R "$bundle" "$APP_PATH/Contents/Resources/"
+done < <(find "$BIN_DIR" -maxdepth 1 -type d -name '*.bundle' -print0)
 
 ICONSET_DIR="$ROOT_DIR/build/still.iconset"
 swift "$ROOT_DIR/Scripts/make_icon.swift" "$ICONSET_DIR"

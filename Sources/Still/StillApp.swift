@@ -13,9 +13,11 @@ struct StillApp: App {
             ContentView(appModel: appModel, commandBus: editorCommands, noteNavigation: noteNavigation)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
                     appModel.store.flushPendingWrites()
+                    appModel.chatStore.flushPendingWrites()
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     appModel.store.flushPendingWrites()
+                    appModel.chatStore.flushPendingWrites()
                 }
         }
         .windowStyle(.hiddenTitleBar)

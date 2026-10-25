@@ -326,6 +326,37 @@ test('wiki autocomplete filters notes and wiki paths and supports pointer and ke
   await page.getByRole('option',{name:'Café Wiki · Plants',exact:true}).click();
   assert.equal(await source(),'[[wiki/Plants/Café]]','Fold-equivalent titles use the canonical target to avoid resolving to the source-local duplicate');
 });
+test('disabling wiki hides wiki targets and suggestions while keeping normal note links and optimize',async()=>{
+  const markdown='[[Source]] and [[wiki/Plants/Fern]]';
+  await page.evaluate(({documents,markdown})=>{
+    window.stillEditor.setLinkDocuments({id:'doc-1',documents});
+    window.stillEditor.setDocument({id:'doc-1',markdown,aiAvailable:true,wikiAvailable:true});
+  },{documents:linkDocuments,markdown});
+  await page.evaluate(({markdown})=>window.stillEditor.setDocument({id:'doc-1',markdown,aiAvailable:true,wikiAvailable:false}),{markdown});
+  await page.locator('.cm-content').evaluate(content=>content.blur());
+  assert.deepEqual(await page.locator('.md-wiki-link').allTextContents(),['Source'],'The normal note link remains available while the Wiki target is hidden');
+  await page.evaluate(()=>window.stillEditor.setDocument({id:'doc-1',markdown:'[[',aiAvailable:true,wikiAvailable:false}));
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);
+  await waitForCompletionLabels(['Fern','Source']);
+  await page.evaluate(()=>window.stillEditor.setDocument({id:'wiki-disabled-toolbar',markdown:'select me',aiAvailable:true,wikiAvailable:false}));
+  await select(0,9);
+  assert.equal(await page.locator('[data-action=wiki]').count(),0,'Wiki creation is absent when the Wiki feature is off');
+  assert.equal(await page.locator('[data-action=optimize]').count(),1,'Text optimization remains available');
+});
+test('AI off leaves enabled Wiki navigation links intact and disables only Wiki generation',async()=>{
+  const markdown='[[wiki/Plants/Fern]]';
+  await page.evaluate(({markdown})=>window.stillEditor.setDocument({id:'ai-off-wiki-link',markdown,aiAvailable:false,wikiAvailable:true}),{markdown});
+  await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'ai-off-wiki-link',documents}),linkDocuments);
+  await page.locator('.cm-content').evaluate(content=>content.blur());
+  assert.equal(await page.locator('.md-wiki-link').count(),1,'Local Wiki links render when AI is off');
+  await page.locator('.md-wiki-link').click({modifiers:['Meta']});
+  const posted=await page.evaluate(()=>window.messages.filter(message=>message.type==='openWikiLink').at(-1));
+  assert.equal(posted?.target,'wiki/Plants/Fern','The editor still sends local navigation requests independently of AI');
+  await page.evaluate(()=>window.stillEditor.focus());
+  await select(0,14);
+  await page.locator('[data-action=wiki]').waitFor();
+  assert.equal(await page.locator('[data-action=wiki]').isDisabled(),true,'Wiki generation requires AI');
+});
 test('wiki autocomplete stays closed when editing inside an already complete token',async()=>{
   await load('[[Fern]]','doc-1');
   await page.evaluate(documents=>window.stillEditor.setLinkDocuments({id:'doc-1',documents}),linkDocuments);

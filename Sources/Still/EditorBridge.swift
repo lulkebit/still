@@ -103,6 +103,7 @@ final class EditorCommandBus {
     private var undoHandler: (() -> Void)?
     private var redoHandler: (() -> Void)?
     private var commandHandler: ((EditorCommand) -> Bool)?
+    @ObservationIgnored private var activeSessionID: UUID?
 
     func send(_ kind: EditorCommand.Kind) {
         let command = EditorCommand(kind: kind)
@@ -137,6 +138,33 @@ final class EditorCommandBus {
         editorFocused = false
         undoHandler = nil
         redoHandler = nil
+    }
+
+    func activateSession(ownerID: UUID, undo: @escaping () -> Void, redo: @escaping () -> Void,
+                         command: @escaping (EditorCommand) -> Bool) {
+        guard activeSessionID != ownerID else { return }
+        activeSessionID = ownerID
+        editorFocused = false
+        undoHandler = undo
+        redoHandler = redo
+        commandHandler = command
+    }
+
+    func clearSession(ownerID: UUID) {
+        guard activeSessionID == ownerID else { return }
+        activeSessionID = nil
+        editorFocused = false
+        undoHandler = nil
+        redoHandler = nil
+        commandHandler = nil
+        pending = nil
+    }
+
+    @discardableResult
+    func setEditorFocused(_ focused: Bool, ownerID: UUID) -> Bool {
+        guard activeSessionID == ownerID else { return false }
+        editorFocused = focused
+        return true
     }
 
     @discardableResult
@@ -223,8 +251,10 @@ struct MarkdownEditor: NSViewRepresentable {
         private var currentTheme = "light"
         private var currentReduceMotion = false
         private var currentAIAvailable = false
+        private var currentWikiAvailable = false
         private var isReady = false
-        private var isEditorFocused = false
+        private let commandSessionID = UUID()
+        private var isDetached = false
         private var lastLinkDocumentsSourceID: UUID?
         private var lastLinkDocuments: [EditorLinkDocument]?
         private var lastLinkCatalogRevision: UInt64?
@@ -240,29 +270,31 @@ struct MarkdownEditor: NSViewRepresentable {
         }
 
         func apply(note: Note?, colorScheme: ColorScheme, reduceMotion: Bool, commands: EditorCommandBus) {
+            guard webView != nil else { return }
+            isDetached = false
             if commandBus !== commands {
-                commandBus?.clearHistoryHandlers()
-                commandBus?.clearCommandHandler()
-                commands.setHistoryHandlers(
+                commandBus?.clearSession(ownerID: commandSessionID)
+                commandBus = commands
+                commands.activateSession(ownerID: commandSessionID,
                     undo: { [weak self] in self?.invoke("undo", payload: [:]) },
-                    redo: { [weak self] in self?.invoke("redo", payload: [:]) }
+                    redo: { [weak self] in self?.invoke("redo", payload: [:]) },
+                    command: { [weak self] command in self?.dispatch(command) ?? false }
                 )
-                commands.setCommandHandler { [weak self] command in self?.dispatch(command) ?? false }
             }
-            commandBus = commands
             guard let note, webView != nil else { return }
+            guard appModel.store.canAccess(note.section) else { return }
             if currentDocumentID != note.id {
-                isEditorFocused = false
-                commands.setEditorFocused(false)
+                commands.setEditorFocused(false, ownerID: commandSessionID)
             }
             let theme = colorScheme == .dark ? "dark" : "light"
             let aiAvailable = appModel.store.settings.enabled
+            let wikiAvailable = appModel.store.wikiEnabled
             let documentChanged = currentDocumentID != note.id || pushedMarkdown != note.markdown
             let appearanceChanged = currentTheme != theme || currentReduceMotion != reduceMotion
-            let availabilityChanged = currentAIAvailable != aiAvailable
+            let availabilityChanged = currentAIAvailable != aiAvailable || currentWikiAvailable != wikiAvailable
             currentDocumentID = note.id
             if lastLinkCatalogRevision != appModel.store.linkCatalogRevision {
-                lastLinkDocuments = appModel.store.notes.map(EditorLinkDocument.init(note:))
+                lastLinkDocuments = appModel.store.visibleNotes.map(EditorLinkDocument.init(note:))
                 lastLinkCatalogRevision = appModel.store.linkCatalogRevision
                 lastLinkDocumentsSourceID = nil
             }
@@ -277,6 +309,7 @@ struct MarkdownEditor: NSViewRepresentable {
             if documentChanged || availabilityChanged {
                 pushedMarkdown = note.markdown
                 currentAIAvailable = aiAvailable
+                currentWikiAvailable = wikiAvailable
                 currentTheme = theme
                 currentReduceMotion = reduceMotion
                 guard isReady else { return }
@@ -287,7 +320,8 @@ struct MarkdownEditor: NSViewRepresentable {
                     "strings": L10n.editorStrings,
                     "theme": theme,
                     "reduceMotion": reduceMotion,
-                    "aiAvailable": aiAvailable
+                    "aiAvailable": aiAvailable,
+                    "wikiAvailable": wikiAvailable
                 ])
             } else if appearanceChanged {
                 currentTheme = theme
@@ -300,13 +334,14 @@ struct MarkdownEditor: NSViewRepresentable {
         }
 
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard !isDetached, webView != nil else { return }
             guard let body = message.body as? [String: Any], let type = body["type"] as? String else { return }
             switch type {
             case "ready":
                 isReady = true
                 lastAIState = nil
                 lastLinkDocumentsSourceID = nil
-                if let note = appModel.store.notes.first(where: { $0.id == currentDocumentID }) {
+                if let note = appModel.store.visibleNotes.first(where: { $0.id == currentDocumentID }) {
                     pushedMarkdown = nil
                     apply(note: note, colorScheme: currentTheme == "dark" ? .dark : .light,
                           reduceMotion: currentReduceMotion, commands: commandBus ?? EditorCommandBus())
@@ -319,18 +354,19 @@ struct MarkdownEditor: NSViewRepresentable {
             case "focus":
                 guard let idString = body["id"] as? String, let id = UUID(uuidString: idString),
                       id == currentDocumentID, let focused = body["focused"] as? Bool else { return }
-                isEditorFocused = focused
-                commandBus?.setEditorFocused(focused)
+                commandBus?.setEditorFocused(focused, ownerID: commandSessionID)
             case "action":
                 guard let action = body["action"] as? String,
                       let idString = body["id"] as? String, let id = UUID(uuidString: idString),
                       id == currentDocumentID, let text = body["text"] as? String else { return }
+                guard appModel.store.notes.first(where: { $0.id == id }).map({ appModel.store.canAccess($0.section) }) == true,
+                      action != "wiki" || appModel.store.wikiEnabled else { return }
                 let from = body["from"] as? Int ?? 0
                 let to = body["to"] as? Int ?? from
                 Task { await perform(action: action, id: id, text: text, from: from, to: to) }
             case "openWikiLink":
                 guard let id = currentDocumentID,
-                      let source = appModel.store.notes.first(where: { $0.id == id }),
+                      let source = appModel.store.visibleNotes.first(where: { $0.id == id }),
                       let request = EditorLinkRequestPolicy.wikiLinkRequest(body: body, currentDocumentID: id,
                                                                             markdown: source.markdown) else { return }
                 onOpenWikiLink(request)
@@ -356,10 +392,9 @@ struct MarkdownEditor: NSViewRepresentable {
         }
 
         func detach() {
+            isDetached = true
             appModel.store.flushPendingWrites()
-            isEditorFocused = false
-            commandBus?.clearHistoryHandlers()
-            commandBus?.clearCommandHandler()
+            commandBus?.clearSession(ownerID: commandSessionID)
             commandBus = nil
             webView = nil
         }
@@ -367,6 +402,7 @@ struct MarkdownEditor: NSViewRepresentable {
         private func dispatch(_ command: EditorCommand) -> Bool {
             guard isReady, webView != nil else { return false }
             guard let currentDocumentID, command.isTargeted(at: currentDocumentID) else { return true }
+            guard appModel.store.visibleNotes.contains(where: { $0.id == currentDocumentID }) else { return true }
 
             switch command.kind {
             case .insertMarkdown(let markdown, _):
@@ -382,6 +418,11 @@ struct MarkdownEditor: NSViewRepresentable {
         }
 
         private func perform(action: String, id: UUID, text: String, from: Int, to: Int) async {
+            guard appModel.store.visibleNotes.contains(where: { $0.id == id }),
+                  action != "wiki" || appModel.store.wikiEnabled else {
+                setAIState(busy: false, label: nil)
+                return
+            }
             setAIState(busy: true, label: L10n.text("editor.busy"))
             do {
                 let result = try await appModel.performAIAction(action, noteID: id, selectedText: text)
@@ -411,6 +452,7 @@ struct MarkdownEditor: NSViewRepresentable {
 
         private func importImage(_ message: [String: Any]) {
             guard let idText = message["id"] as? String, let id = UUID(uuidString: idText), id == currentDocumentID,
+                  appModel.store.visibleNotes.contains(where: { $0.id == id }),
                   let requestID = message["requestId"] as? String,
                   let filename = message["filename"] as? String,
                   let mime = message["mime"] as? String,

@@ -1,5 +1,15 @@
 import SwiftUI
 
+enum CalmMotion {
+    static let quick = Animation.timingCurve(0.2, 0, 0, 1, duration: 0.12)
+    static let standard = Animation.timingCurve(0.2, 0, 0, 1, duration: 0.2)
+
+    static func reveal(reduceMotion: Bool) -> AnyTransition {
+        guard !reduceMotion else { return .identity }
+        return .opacity.combined(with: .offset(y: 4))
+    }
+}
+
 struct FolderDisclosureState: Equatable {
     private(set) var expandedIDs: Set<String>
 
@@ -36,7 +46,7 @@ struct CalmButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .scaleEffect(configuration.isPressed && !reduceMotion ? 0.98 : 1)
-            .animation(reduceMotion ? nil : .spring(response: 0.14, dampingFraction: 0.94), value: configuration.isPressed)
+            .animation(reduceMotion ? nil : CalmMotion.quick, value: configuration.isPressed)
     }
 }
 
@@ -55,7 +65,7 @@ struct CalmHoverModifier: ViewModifier {
                     .allowsHitTesting(false)
             }
             .scaleEffect(isHovered && !reduceMotion ? 1.005 : 1)
-            .animation(reduceMotion ? nil : .easeOut(duration: 0.10), value: isHovered)
+            .animation(reduceMotion ? nil : CalmMotion.quick, value: isHovered)
             .onHover { isHovered = isEnabled && controlIsEnabled && $0 }
             .onChange(of: controlIsEnabled) { _, enabled in
                 if !enabled { isHovered = false }

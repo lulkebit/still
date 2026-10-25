@@ -8,7 +8,7 @@ import { acceptCompletion, autocompletion, closeCompletion, startCompletion } fr
 
 const root = document.getElementById('editor');
 const toolbar = document.getElementById('toolbar');
-let documentId = null, strings = {}, aiAvailable = false, aiBusy = false, aiLabel = null;
+let documentId = null, strings = {}, aiAvailable = false, wikiAvailable = false, aiBusy = false, aiLabel = null;
 let activeLinkMetadata={id:null,documents:[]}, pendingLinkMetadata=null;
 const localizedExtension = new Compartment();
 let stableSelection = null, suppressedSelection = null, toolbarFrame = 0;
@@ -305,6 +305,7 @@ function decodeTargetComponents(value) {
   try{return String(value).split('/').map(component=>decodeURIComponent(component));}catch{return null;}
 }
 function decodeOnce(value) { const components=decodeTargetComponents(value);return components?.length===1?components[0]:null; }
+function isQualifiedWikiTarget(value) { const components=decodeTargetComponents(value);return !!components&&components.length>1&&foldText(components[0])==='wiki'; }
 function targetKey(value) { const components=decodeTargetComponents(value);return components?JSON.stringify(components.map(foldText)):null; }
 function folderPathFor(document) {
   if(document.folders?.length)return document.folders.join('/');
@@ -510,14 +511,15 @@ function wikiCompletionSource(context) {
   if(!documents.length)return null;
   const queryComponents=decodeTargetComponents(candidate.query);
   const query=foldText(queryComponents?queryComponents.join('/'):candidate.query);
-  const filtered=documents.filter(document=>{
+  const availableDocuments=wikiAvailable?documents:documents.filter(document=>document.section!=='wiki');
+  const filtered=availableDocuments.filter(document=>{
     const searchable=foldText([document.title,document.target,document.section,...document.folders].join(' '));
     return !query||searchable.includes(query);
   }).sort((left,right)=>left.title.localeCompare(right.title)||left.target.localeCompare(right.target));
   const options=filtered.slice(0,80).map(document=>{
     const section=tr(document.section==='wiki'?'linkSectionWiki':'linkSectionNotes');
     const folder=document.folders.join('/');
-    return {label:document.title,detail:[section,folder].filter(Boolean).join(' · '),type:document.section==='wiki'?'namespace':'text',apply:completionApplyFor(document,documents)};
+    return {label:document.title,detail:[section,folder].filter(Boolean).join(' · '),type:document.section==='wiki'?'namespace':'text',apply:completionApplyFor(document,availableDocuments)};
   });
   return options.length?{from:candidate.from,to:candidate.to,options,filter:false,update:(_result,_from,_to,nextContext)=>wikiCompletionSource(nextContext)}:null;
 }
@@ -551,7 +553,7 @@ function markdownLinks(state) {
   return analysis.markdownLinks=links;
 }
 function linkAtPosition(state,position) {
-  const wiki=wikiLinks(state).find(link=>position>=link.from&&position<=link.to);
+  const wiki=wikiLinks(state).find(link=>position>=link.from&&position<=link.to&&(wikiAvailable||!isQualifiedWikiTarget(link.target)));
   if(wiki)return {kind:'wiki',link:wiki};
   const external=markdownLinks(state).find(link=>position>=link.from&&position<=link.to&&allowedExternalUrl(link.url));
   return external?{kind:'external',link:external,url:allowedExternalUrl(external.url)}:null;
@@ -654,7 +656,7 @@ function decorationsFor(state,analysis=documentAnalysis(state),activeLines=selec
   }
   const wikiRanges=[],blockOccupied=rangeIndex(occupied);
   for(const link of wiki) {
-    if(rangeIndexContains(blockOccupied,link.from,link.to))continue;
+    if(rangeIndexContains(blockOccupied,link.from,link.to)||!wikiAvailable&&isQualifiedWikiTarget(link.target))continue;
     const active=intersectsSelectionLines(activeLines,link.from,link.to), resolution=resolveWikiTarget(link.target,metadata);
     wikiRanges.push([link.from,link.to]);occupied.push([link.from,link.to]);
     if(active) {
@@ -831,6 +833,7 @@ function action(kind) {
   const selection=stableSelection;
   if(!snapshotValid(selection))return;
   if(kind==='wiki'||kind==='optimize') {
+    if(kind==='wiki'&&!wikiAvailable)return;
     if(aiAvailable&&!aiBusy) {
       suppressedSelection=`${selection.id}:${selection.from}:${selection.to}`;
       hideToolbar(true);aiBusy=true;aiLabel=tr('busy');makeToolbar();
@@ -841,7 +844,7 @@ function action(kind) {
 }
 function makeToolbar() {
   toolbar.replaceChildren(); toolbar.setAttribute('aria-label',tr('selectionToolbar'));
-  const items=[['bold','B'],['italic','I'],['strikethrough','S'],null,['heading1','H1'],['heading2','H2'],['quote','❞'],['code','‹›'],null,['link','↗'],null,['wiki','Wiki'],['optimize','✧']];
+  const items=[['bold','B'],['italic','I'],['strikethrough','S'],null,['heading1','H1'],['heading2','H2'],['quote','❞'],['code','‹›'],null,['link','↗'],null,...(wikiAvailable?[['wiki','Wiki']]:[]),['optimize','✧']];
   for(const item of items) {
     if(!item) { const separator=document.createElement('span');separator.className='toolbar-separator';separator.setAttribute('role','separator');toolbar.append(separator);continue; }
     const [kind,icon]=item; const button=document.createElement('button');button.type='button';button.dataset.action=kind;
@@ -983,15 +986,18 @@ window.addEventListener('resize',()=>{caretMotion?.snap();scheduleToolbar();});
 window.addEventListener('scroll',()=>{caretMotion?.snap();scheduleToolbar();},true);
 window.addEventListener('blur',()=>{caretMotion?.snap();clearTypingReveal(view);hideToolbar(true);});
 window.stillEditor={
-  setDocument({id,markdown:source='',strings:localized={},theme='light',reduceMotion=false,aiAvailable:available=false}) {
+  setDocument({id,markdown:source='',strings:localized={},theme='light',reduceMotion=false,aiAvailable:available=false,wikiAvailable:wiki=true}) {
     const sameDocument=id===documentId;
     const sameSource=sameDocument&&source===view.state.doc.toString();
     const localizationChanged=Object.keys(strings).length!==Object.keys(localized).length||Object.keys(strings).some(key=>strings[key]!==localized[key]);
-    const availabilityChanged=aiAvailable!==available;
-    strings=localized;aiAvailable=available;
+    const availabilityChanged=aiAvailable!==available||wikiAvailable!==wiki;
+    strings=localized;aiAvailable=available;wikiAvailable=wiki;
     this.setAppearance({theme,reduceMotion});
     if(sameSource) {
-      if(localizationChanged)view.dispatch({effects:[localizedExtension.reconfigure(localizedExtensions()),linkMetadataEffect.of(activeLinkMetadata)]});
+      const effects=[];
+      if(localizationChanged)effects.push(localizedExtension.reconfigure(localizedExtensions()));
+      if(localizationChanged||availabilityChanged)effects.push(linkMetadataEffect.of(activeLinkMetadata));
+      if(effects.length)view.dispatch({effects});
       if(localizationChanged||availabilityChanged){makeToolbar();scheduleToolbar();}
       return;
     }

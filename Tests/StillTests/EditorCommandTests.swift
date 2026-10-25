@@ -66,4 +66,68 @@ final class EditorCommandTests: XCTestCase {
         bus.dispatchPending()
         XCTAssertTrue(deliveredDocumentIDs.isEmpty)
     }
+
+    @MainActor
+    func testStaleSessionCleanupCannotClearCurrentHandlersOrPendingCommand() throws {
+        let bus = EditorCommandBus()
+        let oldSessionID = UUID()
+        let currentSessionID = UUID()
+        let documentID = UUID()
+        var oldUndoCount = 0
+        var currentUndoCount = 0
+        var currentRedoCount = 0
+        var oldCommandCount = 0
+        var currentCommandCount = 0
+        var replacementCommandCount = 0
+
+        bus.activateSession(ownerID: oldSessionID,
+                            undo: { oldUndoCount += 1 },
+                            redo: {},
+                            command: { _ in oldCommandCount += 1; return false })
+        bus.send(.insertMarkdown("pending", documentID: documentID))
+        let pendingID = try XCTUnwrap(bus.pending?.id)
+        XCTAssertEqual(oldCommandCount, 1)
+
+        bus.activateSession(ownerID: currentSessionID,
+                            undo: { currentUndoCount += 1 },
+                            redo: { currentRedoCount += 1 },
+                            command: { _ in currentCommandCount += 1; return false })
+        XCTAssertEqual(bus.pending?.id, pendingID)
+
+        // Repeated activation by the same Coordinator must not replace its handlers.
+        bus.activateSession(ownerID: currentSessionID,
+                            undo: {},
+                            redo: {},
+                            command: { _ in replacementCommandCount += 1; return true })
+
+        XCTAssertTrue(bus.setEditorFocused(true, ownerID: currentSessionID))
+        XCTAssertFalse(bus.setEditorFocused(false, ownerID: oldSessionID))
+        XCTAssertTrue(bus.editorFocused)
+        XCTAssertTrue(bus.undoIfEditorFocused())
+        XCTAssertEqual(currentUndoCount, 1)
+        XCTAssertEqual(oldUndoCount, 0)
+
+        bus.dispatchPending()
+        XCTAssertEqual(currentCommandCount, 1)
+        XCTAssertEqual(replacementCommandCount, 0)
+        XCTAssertEqual(bus.pending?.id, pendingID)
+
+        // A late detach from the previous Coordinator cannot clear the current session.
+        bus.clearSession(ownerID: oldSessionID)
+        XCTAssertEqual(bus.pending?.id, pendingID)
+        XCTAssertTrue(bus.editorFocused)
+        bus.dispatchPending()
+        XCTAssertEqual(currentCommandCount, 2)
+        XCTAssertEqual(oldCommandCount, 1)
+        XCTAssertEqual(replacementCommandCount, 0)
+        XCTAssertTrue(bus.redoIfEditorFocused())
+        XCTAssertEqual(currentRedoCount, 1)
+
+        bus.clearSession(ownerID: currentSessionID)
+        XCTAssertNil(bus.pending)
+        XCTAssertFalse(bus.editorFocused)
+        XCTAssertFalse(bus.undoIfEditorFocused())
+        bus.send(.insertMarkdown("after clear", documentID: documentID))
+        XCTAssertNotNil(bus.pending)
+    }
 }

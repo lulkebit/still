@@ -1,9 +1,23 @@
 import Foundation
 import Security
 
-struct AIKeyStore {
-    private let service = "com.still.notes.ai"
-    private let account = "api-key"
+protocol CredentialStore: Sendable {
+    func read() throws -> String?
+    func write(_ value: String) throws
+}
+
+struct AIKeyStore: CredentialStore {
+    private let service: String
+    private let account: String
+
+    init(service: String = "com.still.notes.ai", account: String = "api-key") {
+        self.service = service
+        self.account = account
+    }
+
+    static func confluence(baseURL: String) throws -> AIKeyStore {
+        AIKeyStore(service: "com.still.notes.confluence", account: try ConfluenceInstance(baseURL).keychainAccount)
+    }
 
     func read() throws -> String? {
         let query: [String: Any] = [
