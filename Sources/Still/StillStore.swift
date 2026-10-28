@@ -4,6 +4,7 @@ import Observation
 @MainActor
 @Observable
 final class StillStore {
+    private static let recentNoteLimit = 12
     private(set) var notes: [Note] = []
     private(set) var folders: [Folder] = []
     private(set) var tasks: [TaskItem] = []
@@ -12,6 +13,8 @@ final class StillStore {
     private(set) var wikiEnabled = true
     private(set) var confluenceSettings: ConfluenceSettings = .empty
     private(set) var lastOpenedNoteID: UUID?
+    private(set) var favoriteNoteIDs: [UUID] = []
+    private(set) var recentNoteIDs: [UUID] = []
     private(set) var dirtyNoteIDs: Set<UUID> = []
     private(set) var loadError: String?
     var errorMessage: String?
@@ -49,6 +52,18 @@ final class StillStore {
     var visibleNotes: [Note] { notes.filter { canAccess($0.section) } }
     var visibleFolders: [Folder] { folders.filter { canAccess($0.section) } }
     var visibleTrash: [TrashEntry] { trash.filter { canAccess($0.section) } }
+    var favoriteNotes: [Note] { favoriteNoteIDs.compactMap { id in visibleNotes.first { $0.id == id } } }
+    var recentNotes: [Note] { recentNoteIDs.compactMap { id in visibleNotes.first { $0.id == id } } }
+
+    func isFavoriteNote(_ id: UUID) -> Bool { favoriteNoteIDs.contains(id) }
+
+    func toggleFavoriteNote(_ id: UUID) {
+        guard let note = visibleNotes.first(where: { $0.id == id }), canAccess(note.section), canWrite else { return }
+        var next = favoriteNoteIDs
+        if let index = next.firstIndex(of: id) { next.remove(at: index) }
+        else { next.insert(id, at: 0) }
+        updateNavigationPreferences(favorites: next, recents: recentNoteIDs, lastOpened: lastOpenedNoteID)
+    }
 
     func canAccess(_ section: NoteSection) -> Bool {
         section != .wiki || wikiEnabled
@@ -294,10 +309,16 @@ final class StillStore {
         var nextTrash = trash
         nextTrash.insert(entry, at: 0)
         let previousLastOpened = lastOpenedNoteID
+        let previousFavorites = favoriteNoteIDs
+        let previousRecents = recentNoteIDs
         if lastOpenedNoteID == id { lastOpenedNoteID = notes.first(where: { $0.id != id })?.id }
+        favoriteNoteIDs.removeAll { $0 == id }
+        recentNoteIDs.removeAll { $0 == id }
         do { try saveManifest(notes: notes.filter { $0.id != id }, trash: nextTrash) }
         catch {
             lastOpenedNoteID = previousLastOpened
+            favoriteNoteIDs = previousFavorites
+            recentNoteIDs = previousRecents
             try? removeTrashMarkdown(id: note.id)
             throw error
         }
@@ -400,12 +421,19 @@ final class StillStore {
         let nextNotes = notes.filter { !($0.section == folder.section && $0.folders.starts(with: folder.path)) }
         let nextFolders = folders.filter { !($0.section == folder.section && $0.path.starts(with: folder.path)) }
         let previousLastOpened = lastOpenedNoteID
+        let previousFavorites = favoriteNoteIDs
+        let previousRecents = recentNoteIDs
         if let lastOpenedNoteID, descendants.contains(where: { $0.id == lastOpenedNoteID }) {
             self.lastOpenedNoteID = nextNotes.first?.id
         }
+        let deletedIDs = Set(descendants.map(\.id))
+        favoriteNoteIDs.removeAll { deletedIDs.contains($0) }
+        recentNoteIDs.removeAll { deletedIDs.contains($0) }
         do { try saveManifest(notes: nextNotes, folders: nextFolders, trash: nextTrash) }
         catch {
             lastOpenedNoteID = previousLastOpened
+            favoriteNoteIDs = previousFavorites
+            recentNoteIDs = previousRecents
             for id in copiedToTrash { try? removeTrashMarkdown(id: id) }
             throw error
         }
@@ -461,7 +489,10 @@ final class StillStore {
     }
 
     func setLastOpenedNote(_ id: UUID?) {
-        if let id, let note = notes.first(where: { $0.id == id }), !canAccess(note.section) { return }
+        if let id {
+            recordOpenedNote(id)
+            return
+        }
         guard canWrite, lastOpenedNoteID != id else { return }
         let previous = lastOpenedNoteID
         do {
@@ -469,6 +500,35 @@ final class StillStore {
             lastOpenedNoteID = id
             try saveManifest()
         } catch { lastOpenedNoteID = previous; errorMessage = L10n.text("error.save") }
+    }
+
+    func recordOpenedNote(_ id: UUID) {
+        guard let note = visibleNotes.first(where: { $0.id == id }), canAccess(note.section), canWrite else { return }
+        let nextRecents = ([id] + recentNoteIDs.filter { recentID in
+            recentID != id && notes.contains(where: { $0.id == recentID })
+        }).prefix(Self.recentNoteLimit)
+        updateNavigationPreferences(favorites: favoriteNoteIDs, recents: Array(nextRecents), lastOpened: id)
+    }
+
+    private func updateNavigationPreferences(favorites: [UUID], recents: [UUID], lastOpened: UUID?) {
+        guard canWrite,
+              favorites != favoriteNoteIDs || recents != recentNoteIDs || lastOpened != lastOpenedNoteID else { return }
+        let previousFavorites = favoriteNoteIDs
+        let previousRecents = recentNoteIDs
+        let previousLastOpened = lastOpenedNoteID
+        do {
+            try flushWrites()
+            favoriteNoteIDs = favorites
+            recentNoteIDs = recents
+            lastOpenedNoteID = lastOpened
+            try saveManifest()
+            errorMessage = nil
+        } catch {
+            favoriteNoteIDs = previousFavorites
+            recentNoteIDs = previousRecents
+            lastOpenedNoteID = previousLastOpened
+            errorMessage = L10n.text("error.save")
+        }
     }
 
     func toggleEmbeddedTask(_ task: EmbeddedTask) {
@@ -623,6 +683,9 @@ final class StillStore {
             wikiEnabled = loaded.wikiEnabled
             confluenceSettings = loaded.confluenceSettings
             lastOpenedNoteID = loaded.lastOpenedNoteID
+            let validIDs = Set(loadedNotes.map(\.id))
+            favoriteNoteIDs = Self.unique(loaded.favoriteNoteIDs.filter(validIDs.contains))
+            recentNoteIDs = Array(Self.unique(loaded.recentNoteIDs.filter(validIDs.contains)).prefix(Self.recentNoteLimit))
         } else if hasExistingMarkdownFiles() {
             throw StoreError.missingManifest
         } else if seedIfEmpty {
@@ -708,8 +771,15 @@ final class StillStore {
             settings: settings,
             lastOpenedNoteID: lastOpenedNoteID,
             wikiEnabled: wikiEnabled,
-            confluenceSettings: confluenceSettings
+            confluenceSettings: confluenceSettings,
+            favoriteNoteIDs: favoriteNoteIDs,
+            recentNoteIDs: recentNoteIDs
         )
+    }
+
+    private static func unique(_ ids: [UUID]) -> [UUID] {
+        var seen = Set<UUID>()
+        return ids.filter { seen.insert($0).inserted }
     }
 
     private func ensureWritable() throws {

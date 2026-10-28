@@ -165,6 +165,8 @@ struct StoreManifest: Codable, Sendable {
     var lastOpenedNoteID: UUID?
     var wikiEnabled: Bool = true
     var confluenceSettings: ConfluenceSettings = .empty
+    var favoriteNoteIDs: [UUID] = []
+    var recentNoteIDs: [UUID] = []
 
     static let empty = StoreManifest(
         formatVersion: 1,
@@ -175,14 +177,16 @@ struct StoreManifest: Codable, Sendable {
         settings: .empty,
         lastOpenedNoteID: nil,
         wikiEnabled: true,
-        confluenceSettings: .empty
+        confluenceSettings: .empty,
+        favoriteNoteIDs: [],
+        recentNoteIDs: []
     )
 }
 
 extension StoreManifest {
     private enum CodingKeys: String, CodingKey {
         case formatVersion, notes, folders, tasks, trash, settings, lastOpenedNoteID
-        case wikiEnabled, confluenceSettings
+        case wikiEnabled, confluenceSettings, favoriteNoteIDs, recentNoteIDs
     }
 
     init(from decoder: Decoder) throws {
@@ -196,6 +200,8 @@ extension StoreManifest {
         lastOpenedNoteID = try values.decodeIfPresent(UUID.self, forKey: .lastOpenedNoteID)
         wikiEnabled = try values.decodeIfPresent(Bool.self, forKey: .wikiEnabled) ?? true
         confluenceSettings = try values.decodeIfPresent(ConfluenceSettings.self, forKey: .confluenceSettings) ?? .empty
+        favoriteNoteIDs = try values.decodeIfPresent([UUID].self, forKey: .favoriteNoteIDs) ?? []
+        recentNoteIDs = try values.decodeIfPresent([UUID].self, forKey: .recentNoteIDs) ?? []
     }
 }
 

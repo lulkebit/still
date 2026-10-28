@@ -1,104 +1,6 @@
 import AppKit
 import SwiftUI
 
-struct GlobalSearchBoard: View {
-    let store: StillStore
-    let query: String
-    let onOpenNote: (UUID) -> Void
-    let onOpenTask: (UUID) -> Void
-    let onOpenEmbeddedTask: (EmbeddedTask) -> Void
-
-    private enum Result: Identifiable {
-        case note(Note)
-        case task(TaskItem)
-        case embedded(EmbeddedTask)
-
-        var id: String {
-            switch self {
-            case .note(let value): "note:\(value.id)"
-            case .task(let value): "task:\(value.id)"
-            case .embedded(let value): "embedded:\(value.id)"
-            }
-        }
-        var title: String {
-            switch self {
-            case .note(let value): value.title
-            case .task(let value): value.title
-            case .embedded(let value): value.title
-            }
-        }
-        var subtitle: String {
-            switch self {
-            case .note(let value): L10n.text(value.section == .wiki ? "nav.wiki" : "nav.notes")
-            case .task: L10n.text("task.standalone")
-            case .embedded(let value): String(format: L10n.text("task.source"), value.noteTitle)
-            }
-        }
-        var icon: String {
-            switch self {
-            case .note(let value): value.section == .wiki ? "books.vertical" : "note.text"
-            case .task: "checklist"
-            case .embedded: "checkmark.square"
-            }
-        }
-    }
-
-    private var results: [Result] {
-        let notes = store.visibleNotes.filter { $0.title.localizedCaseInsensitiveContains(query) || $0.markdown.localizedCaseInsensitiveContains(query) }.map(Result.note)
-        let tasks = store.tasks.filter { $0.title.localizedCaseInsensitiveContains(query) || $0.detail.localizedCaseInsensitiveContains(query) }.map(Result.task)
-        let embedded = store.embeddedTasks.filter { $0.title.localizedCaseInsensitiveContains(query) || $0.noteTitle.localizedCaseInsensitiveContains(query) }.map(Result.embedded)
-        return (notes + tasks + embedded).sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(L10n.text("list.searchResults")).font(.system(size: 21, weight: .medium, design: .serif))
-                    Text(query).font(.system(size: 12)).foregroundStyle(.secondary)
-                }
-                Spacer()
-                Text("\(results.count)").font(.system(size: 11, design: .rounded)).foregroundStyle(.tertiary)
-            }
-            .padding(.bottom, 18)
-            if results.isEmpty {
-                Text(L10n.text("list.noSearchResults")).font(.system(size: 13)).foregroundStyle(.secondary)
-                Spacer()
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 1) {
-                        ForEach(results) { result in
-                            Button {
-                                switch result {
-                                case .note(let note): onOpenNote(note.id)
-                                case .task(let task): onOpenTask(task.id)
-                                case .embedded(let task): onOpenEmbeddedTask(task)
-                                }
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: result.icon).font(.system(size: 13)).foregroundStyle(.secondary).frame(width: 18)
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(result.title).font(.system(size: 13, weight: .medium)).foregroundStyle(.primary).lineLimit(1)
-                                        Text(result.subtitle).font(.system(size: 11)).foregroundStyle(.tertiary).lineLimit(1)
-                                    }
-                                    Spacer(minLength: 0)
-                                    Image(systemName: "arrow.up.left").font(.system(size: 10)).foregroundStyle(.quaternary)
-                                }
-                                .padding(.horizontal, 10).padding(.vertical, 10).contentShape(Rectangle())
-                            }
-                            .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
-                            .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.04)).frame(height: 0.5) }
-                        }
-                    }
-                }
-                Spacer(minLength: 0)
-            }
-        }
-        .padding(.horizontal, 52).padding(.top, 58).padding(.bottom, 30)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-}
-
 struct TaskBoardView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let appModel: StillAppModel
@@ -106,6 +8,16 @@ struct TaskBoardView: View {
     @Binding var selectedTaskID: UUID?
     let onOpenNote: (UUID) -> Void
     @State private var draftTitle = ""
+    @State private var focusPresentation = TaskFocusPresentationState()
+
+    private var selectedFilter: TaskFocusFilter {
+        get { focusPresentation.filter }
+        nonmutating set { focusPresentation.filter = newValue }
+    }
+    private var showsDoneTasks: Bool {
+        get { focusPresentation.showsDoneTasks }
+        nonmutating set { focusPresentation.showsDoneTasks = newValue }
+    }
 
     private var store: StillStore { appModel.store }
     private var sortedTasks: [TaskItem] { store.tasks.sorted { lhs, rhs in
@@ -125,84 +37,175 @@ struct TaskBoardView: View {
     } }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                VStack(alignment: .leading, spacing: 17) {
-                    Text(L10n.text("nav.tasks")).font(.system(size: 30, weight: .medium, design: .serif)).tracking(-0.5)
-                    HStack(spacing: 9) {
-                        TextField(L10n.text("task.newPlaceholder"), text: $draftTitle)
-                            .textFieldStyle(.plain).font(.system(size: 13))
-                            .onSubmit(addTask).accessibilityIdentifier("new-task-title")
-                        Button(action: addTask) {
-                            Image(systemName: "plus").font(.system(size: 12, weight: .semibold)).frame(width: 28, height: 28)
-                        }
-                        .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover()
-                        .foregroundStyle(.secondary).help(L10n.text("task.add"))
-                        .accessibilityIdentifier("new-task")
-                    }
-                    .padding(.vertical, 6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .overlay(alignment: .bottom) {
-                        Rectangle().fill(Color.primary.opacity(0.09)).frame(height: 0.5).allowsHitTesting(false)
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 0) {
-                    sectionHeading("task.standalone", count: sortedTasks.count).padding(.bottom, 5)
-                    if sortedTasks.isEmpty {
-                        Text(L10n.text("task.empty"))
-                            .font(.system(size: 12)).foregroundStyle(.tertiary).padding(.vertical, 7)
-                            .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
-                    } else {
-                        ForEach(sortedTasks) { task in
-                            StandaloneTaskRow(task: task, appModel: appModel,
-                                              isExpanded: selectedTaskID == task.id,
-                                              onToggle: { toggle(task) },
-                                              onExpand: { selectedTaskID = selectedTaskID == task.id ? nil : task.id },
-                                              onOpenNote: onOpenNote,
-                                              onDelete: { delete(task) })
-                        }
-                    }
-                }
-
-                let embedded = store.embeddedTasks.sorted { $0.noteTitle.localizedStandardCompare($1.noteTitle) == .orderedAscending }
-                VStack(alignment: .leading, spacing: 9) {
-                    sectionHeading(store.wikiEnabled ? "task.checklists" : "task.checklists.notesOnly", count: embedded.count)
-                    if embedded.isEmpty {
-                        Text(L10n.text(store.wikiEnabled ? "task.noChecklists" : "task.noChecklists.notesOnly"))
-                            .font(.system(size: 12)).foregroundStyle(.tertiary).padding(.vertical, 7)
-                    } else {
-                        ForEach(embedded) { item in
-                            HStack(spacing: 10) {
-                                Button { store.toggleEmbeddedTask(item) } label: {
-                                    Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
-                                        .font(.system(size: 16)).foregroundStyle(item.isDone ? Color.accentColor : Color.secondary)
-                                        .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
-                                        .animation(reduceMotion ? nil : CalmMotion.quick, value: item.isDone)
-                                }
-                                .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
-                                .accessibilityLabel(L10n.text(item.isDone ? "task.reopen" : "task.complete"))
-                                Button { onOpenNote(item.noteID) } label: {
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(item.title).font(.system(size: 12)).foregroundStyle(item.isDone ? .secondary : .primary)
-                                            .strikethrough(item.isDone, color: .secondary).lineLimit(2)
-                                        Text(String(format: L10n.text("task.source"), item.noteTitle))
-                                            .font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
-                                    }
-                                    .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
-                                }
-                                .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
+        TimelineView(.periodic(from: .now, by: 60)) { timeline in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 17) {
+                        Text(L10n.text("nav.tasks")).font(.system(size: 30, weight: .medium, design: .serif)).tracking(-0.5)
+                        HStack(spacing: 9) {
+                            TextField(L10n.text("task.newPlaceholder"), text: $draftTitle)
+                                .textFieldStyle(.plain).font(.system(size: 13))
+                                .onSubmit(addTask).accessibilityIdentifier("new-task-title")
+                            Button(action: addTask) {
+                                Image(systemName: "plus").font(.system(size: 12, weight: .semibold)).frame(width: 28, height: 28)
                             }
-                            .padding(.vertical, 7).overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.045)).frame(height: 0.5) }
+                            .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover()
+                            .foregroundStyle(.secondary).help(L10n.text("task.add"))
+                            .accessibilityIdentifier("new-task")
+                        }
+                        .padding(.vertical, 6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .overlay(alignment: .bottom) {
+                            Rectangle().fill(Color.primary.opacity(0.09)).frame(height: 0.5).allowsHitTesting(false)
+                        }
+                    }
+
+                    filterPicker
+
+                    VStack(alignment: .leading, spacing: 0) {
+                        sectionHeading(selectedFilter.localizationKey, count: visibleTasks(at: timeline.date).count).padding(.bottom, 5)
+                        let focusedTasks = visibleTasks(at: timeline.date)
+                        if focusedTasks.isEmpty {
+                            Text(L10n.text(emptyMessageKey))
+                                .font(.system(size: 12)).foregroundStyle(.tertiary).padding(.vertical, 7)
+                                .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
+                        } else {
+                            ForEach(focusedTasks) { task in
+                                StandaloneTaskRow(task: task, appModel: appModel,
+                                                  isExpanded: selectedTaskID == task.id,
+                                                  now: timeline.date,
+                                                  onToggle: { toggle(task) },
+                                                  onExpand: { selectedTaskID = selectedTaskID == task.id ? nil : task.id },
+                                                  onOpenNote: onOpenNote,
+                                                  onDelete: { delete(task) })
+                            }
+                        }
+                    }
+
+                    if selectedFilter == .all {
+                        let embedded = store.embeddedTasks.filter { !$0.isDone }
+                            .sorted { $0.noteTitle.localizedStandardCompare($1.noteTitle) == .orderedAscending }
+                        VStack(alignment: .leading, spacing: 9) {
+                            sectionHeading(store.wikiEnabled ? "task.checklists" : "task.checklists.notesOnly", count: embedded.count)
+                            if embedded.isEmpty {
+                                Text(L10n.text(store.wikiEnabled ? "task.noChecklists" : "task.noChecklists.notesOnly"))
+                                    .font(.system(size: 12)).foregroundStyle(.tertiary).padding(.vertical, 7)
+                            } else {
+                                ForEach(embedded) { item in embeddedTaskRow(item) }
+                            }
+                        }
+                    }
+
+                    if doneCount > 0 {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Button {
+                                withAnimation(reduceMotion ? nil : CalmMotion.quick) { focusPresentation.toggleDone() }
+                            } label: {
+                                HStack(spacing: 7) {
+                                    Image(systemName: doneExpanded ? "chevron.down" : "chevron.right")
+                                        .font(.system(size: 9, weight: .medium)).foregroundStyle(.tertiary)
+                                    Text(L10n.text("task.focus.done"))
+                                        .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                                    Text("\(doneCount)")
+                                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                                    Spacer()
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(CalmButtonStyle()).pointerStyle(.link)
+                            .accessibilityIdentifier("task-done-section-toggle")
+
+                            if doneExpanded {
+                                ForEach(doneTasks) { task in
+                                    StandaloneTaskRow(task: task, appModel: appModel,
+                                                      isExpanded: selectedTaskID == task.id,
+                                                      now: timeline.date,
+                                                      onToggle: { toggle(task) },
+                                                      onExpand: { selectedTaskID = selectedTaskID == task.id ? nil : task.id },
+                                                      onOpenNote: onOpenNote,
+                                                      onDelete: { delete(task) })
+                                }
+                                ForEach(doneEmbeddedTasks) { item in embeddedTaskRow(item) }
+                            }
                         }
                     }
                 }
+                .frame(maxWidth: 720, alignment: .leading)
+                .padding(.horizontal, 50).padding(.top, 58).padding(.bottom, 60)
+                .frame(maxWidth: .infinity, alignment: .center)
             }
-            .frame(maxWidth: 720, alignment: .leading)
-            .padding(.horizontal, 50).padding(.top, 58).padding(.bottom, 60)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .accessibilityIdentifier("task-board")
+        .onAppear(perform: revealSelectedTaskIfNeeded)
+        .onChange(of: selectedTaskID) { _, _ in revealSelectedTaskIfNeeded() }
         }
-        .accessibilityIdentifier("task-board")
+    }
+
+    private var filterPicker: some View {
+        HStack(spacing: 4) {
+            ForEach(TaskFocusFilter.allCases) { filter in
+                let isSelected = selectedFilter == filter
+                Button {
+                    selectedFilter = filter
+                } label: {
+                    Text(L10n.text(filter.localizationKey))
+                        .font(.system(size: 11, weight: isSelected ? .medium : .regular))
+                        .foregroundStyle(isSelected ? .primary : .secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(isSelected ? Color.primary.opacity(0.065) : .clear, in: Capsule())
+                }
+                .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 18)
+                .accessibilityAddTraits(isSelected ? .isSelected : [])
+                .accessibilityIdentifier("task-focus-\(filter.rawValue)")
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var doneTasks: [TaskItem] { sortedTasks.filter { $0.status == .done } }
+    private var doneEmbeddedTasks: [EmbeddedTask] {
+        store.embeddedTasks.filter(\.isDone)
+            .sorted { $0.noteTitle.localizedStandardCompare($1.noteTitle) == .orderedAscending }
+    }
+    private var doneCount: Int { doneTasks.count + doneEmbeddedTasks.count }
+    private var doneExpanded: Bool { focusPresentation.showsDoneTasks }
+    private var emptyMessageKey: String {
+        selectedFilter == .all ? "task.empty" : "task.focus.empty.\(selectedFilter.rawValue)"
+    }
+
+    private func visibleTasks(at now: Date) -> [TaskItem] {
+        TaskFocusPolicy.tasks(sortedTasks, matching: selectedFilter, now: now)
+    }
+
+    private func revealSelectedTaskIfNeeded() {
+        guard let selectedTaskID, let selected = store.tasks.first(where: { $0.id == selectedTaskID }) else { return }
+        focusPresentation.revealSelection(selected)
+    }
+
+    @ViewBuilder
+    private func embeddedTaskRow(_ item: EmbeddedTask) -> some View {
+        HStack(spacing: 10) {
+            Button { store.toggleEmbeddedTask(item) } label: {
+                Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 16)).foregroundStyle(item.isDone ? Color.accentColor : Color.secondary)
+                    .contentTransition(reduceMotion ? .identity : .symbolEffect(.replace))
+                    .animation(reduceMotion ? nil : CalmMotion.quick, value: item.isDone)
+            }
+            .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
+            .accessibilityLabel(L10n.text(item.isDone ? "task.reopen" : "task.complete"))
+            Button { onOpenNote(item.noteID) } label: {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(item.title).font(.system(size: 12)).foregroundStyle(item.isDone ? .secondary : .primary)
+                        .strikethrough(item.isDone, color: .secondary).lineLimit(2)
+                    Text(String(format: L10n.text("task.source"), item.noteTitle))
+                        .font(.system(size: 10)).foregroundStyle(.tertiary).lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+            }
+            .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
+        }
+        .padding(.vertical, 7)
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.045)).frame(height: 0.5) }
     }
 
     private func sectionHeading(_ key: String, count: Int) -> some View {
@@ -222,6 +225,7 @@ struct TaskBoardView: View {
             let task = try withAnimation(reduceMotion ? nil : CalmMotion.standard) {
                 try store.createTask(title: draftTitle)
             }
+            selectedFilter = .all
             selectedTaskID = task.id
             draftTitle = ""
         } catch { store.report(error) }
@@ -230,6 +234,7 @@ struct TaskBoardView: View {
     private func toggle(_ task: TaskItem) {
         var updated = task
         updated.status = task.status == .done ? .open : .done
+        if updated.status == .done, selectedTaskID == task.id { focusPresentation.showsDoneTasks = true }
         withAnimation(reduceMotion ? nil : CalmMotion.quick) {
             do { try store.updateTask(updated) } catch { store.report(error) }
         }
@@ -240,6 +245,7 @@ struct TaskBoardView: View {
             try withAnimation(reduceMotion ? nil : CalmMotion.standard) {
                 try store.deleteTask(id: task.id)
             }
+            if selectedTaskID == task.id { selectedTaskID = nil }
         }
         catch { store.report(error) }
     }
@@ -250,6 +256,7 @@ private struct StandaloneTaskRow: View {
     let task: TaskItem
     let appModel: StillAppModel
     let isExpanded: Bool
+    let now: Date
     let onToggle: () -> Void
     let onExpand: () -> Void
     let onOpenNote: (UUID) -> Void
@@ -303,7 +310,13 @@ private struct StandaloneTaskRow: View {
                             }
                             if task.dueDate != nil || task.priority == .high {
                                 HStack(spacing: 8) {
-                                    if let dueDate = task.dueDate { Text(dueDate, style: .date) }
+                                    if let dueDate = task.dueDate {
+                                        Text(dueDate, style: .date)
+                                        if TaskFocusPolicy.isOverdue(task, now: now) {
+                                            Text(L10n.text("task.overdue"))
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
                                     if task.priority == .high { Label(L10n.text("task.priority.high"), systemImage: "flag.fill") }
                                 }.font(.system(size: 10)).foregroundStyle(.tertiary)
                             }
@@ -423,6 +436,12 @@ private struct StandaloneTaskRow: View {
             appModel.aiError = L10n.text("error.aiSelectionChanged")
             return
         }
+        if action == "optimize" {
+            _ = appModel.beginAIReview(target: .task(task.id), originalDocument: original,
+                                       selectedText: source, range: range,
+                                       applyTaskReplacement: applyReplacement)
+            return
+        }
         pendingAIOriginal = original
         pendingAIRange = range
         isWikiBusy = true
@@ -462,6 +481,42 @@ struct TaskTextSelectionSnapshot: Equatable {
     func matches(_ content: String) -> Bool {
         range.location >= 0 && range.length > 0 && NSMaxRange(range) <= (content as NSString).length
             && (content as NSString).substring(with: range) == text
+    }
+}
+
+@MainActor
+final class TaskTextUndoObserver {
+    private weak var textView: NSTextView?
+    private weak var observedUndoManager: UndoManager?
+    private var notificationTokens: [NSObjectProtocol] = []
+    private let onUndoOrRedo: (String) -> Void
+
+    init(textView: NSTextView, onUndoOrRedo: @escaping (String) -> Void) {
+        self.textView = textView
+        self.onUndoOrRedo = onUndoOrRedo
+        refresh()
+    }
+
+    func refresh() {
+        guard let textView, let undoManager = textView.undoManager,
+              observedUndoManager !== undoManager else { return }
+        cancel()
+        observedUndoManager = undoManager
+        let center = NotificationCenter.default
+        for name in [Notification.Name.NSUndoManagerDidUndoChange, Notification.Name.NSUndoManagerDidRedoChange] {
+            notificationTokens.append(center.addObserver(forName: name, object: undoManager, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, let textView = self.textView else { return }
+                    self.onUndoOrRedo(textView.string)
+                }
+            })
+        }
+    }
+
+    func cancel() {
+        for token in notificationTokens { NotificationCenter.default.removeObserver(token) }
+        notificationTokens.removeAll()
+        observedUndoManager = nil
     }
 }
 
@@ -522,6 +577,7 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
         view.onAIAction = { [weak coordinator = context.coordinator] action, selected, range, apply in
             coordinator?.onAIAction(action, selected, range, apply)
         }
+        context.coordinator.observeUndoChanges(for: view)
         view.isAIEnabled = isAIEnabled
         view.isWikiEnabled = isWikiEnabled
         if view.string != text, !view.hasMarkedText() {
@@ -538,6 +594,7 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
         view.delegate = nil
         view.onAIAction = nil
         view.setAIBusy(false, selectionRange: nil, sourceText: nil, reduceMotion: true)
+        coordinator.cancelUndoObservation()
         coordinator.textView = nil
     }
 
@@ -546,6 +603,7 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
         var onChange: (String) -> Void
         var onAIAction: (String, String, NSRange, @escaping (String) -> Bool) -> Void
         weak var textView: NSTextView?
+        private var undoObserver: TaskTextUndoObserver?
 
         init(onChange: @escaping (String) -> Void, onAIAction: @escaping (String, String, NSRange, @escaping (String) -> Bool) -> Void) {
             self.onChange = onChange
@@ -558,6 +616,18 @@ private struct TaskDescriptionTextView: NSViewRepresentable {
                 taskTextView.setAIBusy(false, selectionRange: nil, sourceText: nil, reduceMotion: true)
             }
             onChange(view.string)
+        }
+
+        func observeUndoChanges(for view: NSTextView) {
+            if undoObserver == nil {
+                undoObserver = TaskTextUndoObserver(textView: view) { [weak self] text in self?.onChange(text) }
+            }
+            undoObserver?.refresh()
+        }
+
+        func cancelUndoObservation() {
+            undoObserver?.cancel()
+            undoObserver = nil
         }
     }
 }

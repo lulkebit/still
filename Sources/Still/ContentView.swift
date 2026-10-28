@@ -29,6 +29,11 @@ private struct StatusBannerSnapshot: Hashable {
     let message: String
 }
 
+private struct PendingSearchNavigation: Equatable {
+    let documentID: UUID
+    let query: String?
+}
+
 private enum WorkspaceRoute: Hashable {
     case search
     case tasks
@@ -42,6 +47,60 @@ private enum SidebarContentRoute: Hashable {
     case chats
     case trash
     case empty
+}
+
+private struct MissingWikiLinkDialog: ViewModifier {
+    @Binding var isPresented: Bool
+    let details: String
+    let onCreate: () -> Void
+    let onCancel: () -> Void
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            L10n.text("dialog.createLinkedNoteTitle"),
+            isPresented: $isPresented,
+            titleVisibility: .visible
+        ) {
+            Button(L10n.text("dialog.createLinkedNoteAction"), action: onCreate).pointerStyle(.link)
+            Button(L10n.text("action.cancel"), role: .cancel, action: onCancel).pointerStyle(.link)
+        } message: {
+            Text(verbatim: details)
+        }
+    }
+}
+
+private struct FolderTrashDialog: ViewModifier {
+    @Binding var isPresented: Bool
+    let message: String
+    let onDelete: () -> Void
+    let onCancel: () -> Void
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(L10n.text("dialog.deleteFolderTitle"), isPresented: $isPresented,
+                                   titleVisibility: .visible) {
+            Button(L10n.text("list.deleteFolder"), role: .destructive, action: onDelete).pointerStyle(.link)
+            Button(L10n.text("action.cancel"), role: .cancel, action: onCancel).pointerStyle(.link)
+        } message: {
+            Text(verbatim: message)
+        }
+    }
+}
+
+private struct NoteTrashDialog: ViewModifier {
+    @Binding var isPresented: Bool
+    let message: String
+    let onDelete: () -> Void
+    let onCancel: () -> Void
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(L10n.text("dialog.deleteNoteTitle"), isPresented: $isPresented,
+                                   titleVisibility: .visible) {
+            Button(L10n.text("list.delete"), role: .destructive, action: onDelete).pointerStyle(.link)
+            Button(L10n.text("action.cancel"), role: .cancel, action: onCancel).pointerStyle(.link)
+        } message: {
+            Text(verbatim: message)
+        }
+    }
 }
 
 private enum SheetRoute: Identifiable {
@@ -71,6 +130,9 @@ struct ContentView: View {
     @State private var query = ""
     @State private var showTrash = false
     @State private var showSettings = false
+    @State private var showQuickOpen = false
+    @State private var searchSelectionIndex = 0
+    @State private var pendingSearchNavigation: PendingSearchNavigation?
     @State private var isSidebarVisible = true
     @State private var focusSearchWhenVisible = false
     @State private var lastSidebarShortcutTime: TimeInterval = 0
@@ -91,6 +153,133 @@ struct ContentView: View {
     private var currentNoteSection: NoteSection { activeSection == .wiki ? .wiki : .notes }
 
     var body: some View {
+        presentedShell
+            .modifier(FolderTrashDialog(
+                isPresented: $showFolderTrashConfirmation,
+                message: L10n.text("dialog.deleteFolderBody"),
+                onDelete: { trashFolder() },
+                onCancel: { folderToTrash = nil }
+            ))
+            .modifier(NoteTrashDialog(
+                isPresented: $showNoteTrashConfirmation,
+                message: L10n.text("dialog.deleteNoteBody"),
+                onDelete: { trashNote() },
+                onCancel: { noteToTrash = nil }
+            ))
+            .modifier(MissingWikiLinkDialog(
+                isPresented: $showingMissingWikiLink,
+                details: missingWikiLinkDetails,
+                onCreate: { createMissingWikiLink() },
+                onCancel: { pendingWikiLink = nil }
+            ))
+    }
+
+    private var commandShell: some View {
+        rootShell
+        .onAppear {
+            noteNavigation.updateNotes(store.visibleNotes)
+            restoreLastNote()
+            syncCurrentNoteContext()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .stillNavigateBack)) { _ in navigateBack() }
+        .onReceive(NotificationCenter.default.publisher(for: .stillToggleSidebar)) { _ in
+            toggleSidebarFromShortcut()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .stillFocusSearch), perform: handleFocusSearch)
+        .onReceive(NotificationCenter.default.publisher(for: .stillQuickOpen)) { _ in showQuickOpen = true }
+        .onReceive(NotificationCenter.default.publisher(for: .stillShowFind)) { _ in findInCurrentNote() }
+        .onReceive(NotificationCenter.default.publisher(for: .stillCreateNote)) { _ in createNoteFromShortcut() }
+    }
+
+    private var observedShell: some View {
+        commandShell
+        .onChange(of: appModel.editorDocumentID) { _, id in dispatchPendingSearchNavigation(for: id) }
+        .onChange(of: selectedNoteID) { _, id in handleSelectedNoteChange(id) }
+        .onChange(of: workspaceRoute) { _, route in handleWorkspaceRouteChange(route) }
+        .onChange(of: folderPath) { _, path in handleFolderPathChange(path) }
+        .onChange(of: store.notes) { _, _ in
+            noteNavigation.updateNotes(store.visibleNotes)
+            repairSelection(after: store.visibleNotes)
+        }
+        .onChange(of: store.wikiEnabled) { _, enabled in handleWikiAvailabilityChange(enabled) }
+        .onChange(of: showTrash) { _, isTrash in
+            if isTrash { selectedTrashID = store.visibleTrash.first?.id }
+        }
+        .onChange(of: statusBannerSources) { _, sources in
+            dismissedStatusBanners.formIntersection(Set(sources))
+        }
+    }
+
+    private var presentedShell: some View {
+        observedShell
+        .sheet(isPresented: $showSettings) {
+            AISettingsView(appModel: appModel)
+                .presentationBackground(.clear)
+        }
+        .sheet(item: $sheetRoute, content: sheetContent)
+        .sheet(item: aiReviewBinding) { _ in
+            AIReviewSheet(appModel: appModel)
+                .presentationBackground(.clear)
+        }
+    }
+
+    private var aiReviewBinding: Binding<AIReviewRequest?> {
+        Binding(
+            get: { appModel.pendingAIReview },
+            set: { value in
+                if value == nil { appModel.discardAIReview() }
+                else { appModel.pendingAIReview = value }
+            }
+        )
+    }
+
+    private func handleFocusSearch(_ notification: Notification) {
+        if isSidebarVisible {
+            focusSearchWhenVisible = true
+            return
+        }
+        setSidebarVisibilityImmediately(true)
+        focusSearchWhenVisible = true
+    }
+
+    private func handleSelectedNoteChange(_ id: UUID?) {
+        store.setLastOpenedNote(id)
+        if let id, store.visibleNotes.contains(where: { $0.id == id }) { appModel.currentNoteID = id }
+        else if let oldID = appModel.currentNoteID,
+                !store.visibleNotes.contains(where: { $0.id == oldID }) { appModel.currentNoteID = nil }
+        if pendingSearchNavigation?.documentID != id { pendingSearchNavigation = nil }
+    }
+
+    private func handleWorkspaceRouteChange(_ route: WorkspaceRoute) {
+        if route == .document { dispatchPendingSearchNavigation(for: appModel.editorDocumentID) }
+        else { pendingSearchNavigation = nil }
+    }
+
+    private func handleFolderPathChange(_ path: [String]) {
+        guard !showTrash, activeSection != .tasks, activeSection != .chat else { return }
+        if let selectedNote, selectedNote.section == currentNoteSection, selectedNote.folders == path { return }
+        let nextID = store.notes(in: currentNoteSection, folderPath: path).first?.id
+        noteNavigation.record(from: selectedNoteID, to: nextID)
+        selectedNoteID = nextID
+    }
+
+    private func handleWikiAvailabilityChange(_ enabled: Bool) {
+        noteNavigation.updateNotes(store.visibleNotes)
+        guard !enabled else { return }
+        if activeSection == .wiki || (activeSection != .chat && selectedNote.map({ !store.canAccess($0.section) }) == true) {
+            showTrash = false
+            activeSection = .notes
+            folderPath = []
+            let nextNote = store.notes(in: .notes).first
+            noteNavigation.record(from: selectedNoteID, to: nextNote?.id)
+            selectedNoteID = nextNote?.id
+        }
+        if showTrash, selectedTrashID.flatMap({ id in store.trash.first(where: { $0.id == id })?.section }) == .wiki {
+            selectedTrashID = store.visibleTrash.first?.id
+        }
+    }
+
+    private var rootShell: some View {
         ZStack {
             windowBackground
             if !reduceTransparency {
@@ -106,89 +295,16 @@ struct ContentView: View {
         .overlay(alignment: .top) {
             statusBanner.animation(reduceMotion ? nil : CalmMotion.standard, value: visibleStatusBanner)
         }
-        .onAppear {
-            noteNavigation.updateNotes(store.visibleNotes)
-            restoreLastNote()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .stillNavigateBack)) { _ in navigateBack() }
-        .onReceive(NotificationCenter.default.publisher(for: .stillToggleSidebar)) { _ in
-            toggleSidebarFromShortcut()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .stillFocusSearch)) { _ in
-            guard !isSidebarVisible else {
-                focusSearchWhenVisible = true
-                return
+        .overlay {
+            if showQuickOpen {
+                QuickOpenOverlay(
+                    store: store,
+                    onClose: { showQuickOpen = false },
+                    onOpenNote: openSearchNote,
+                    onOpenTask: openSearchTask,
+                    onOpenEmbeddedTask: openSearchNote
+                )
             }
-            setSidebarVisibilityImmediately(true)
-            focusSearchWhenVisible = true
-        }
-        .onChange(of: selectedNoteID) { _, id in store.setLastOpenedNote(id) }
-        .onChange(of: folderPath) { _, path in
-            guard !showTrash, activeSection != .tasks, activeSection != .chat else { return }
-            if let selectedNote, selectedNote.section == currentNoteSection, selectedNote.folders == path { return }
-            let nextID = store.notes(in: currentNoteSection, folderPath: path).first?.id
-            noteNavigation.record(from: selectedNoteID, to: nextID)
-            selectedNoteID = nextID
-        }
-        .onChange(of: store.notes) { _, _ in
-            noteNavigation.updateNotes(store.visibleNotes)
-            repairSelection(after: store.visibleNotes)
-        }
-        .onChange(of: store.wikiEnabled) { _, enabled in
-            noteNavigation.updateNotes(store.visibleNotes)
-            guard !enabled else { return }
-            if activeSection == .wiki || (activeSection != .chat && selectedNote.map({ !store.canAccess($0.section) }) == true) {
-                showTrash = false
-                activeSection = .notes
-                folderPath = []
-                let nextNote = store.notes(in: .notes).first
-                noteNavigation.record(from: selectedNoteID, to: nextNote?.id)
-                selectedNoteID = nextNote?.id
-            }
-            if showTrash, selectedTrashID.flatMap({ id in store.trash.first(where: { $0.id == id })?.section }) == .wiki {
-                selectedTrashID = store.visibleTrash.first?.id
-            }
-        }
-        .onChange(of: showTrash) { _, isTrash in
-            if isTrash { selectedTrashID = store.visibleTrash.first?.id }
-        }
-        .onChange(of: statusBannerSources) { _, sources in
-            dismissedStatusBanners.formIntersection(Set(sources))
-        }
-        .sheet(isPresented: $showSettings) {
-            AISettingsView(appModel: appModel)
-                .presentationBackground(.clear)
-        }
-        .sheet(item: $sheetRoute, content: sheetContent)
-        .confirmationDialog(
-            L10n.text("dialog.deleteFolderTitle"),
-            isPresented: $showFolderTrashConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button(L10n.text("list.deleteFolder"), role: .destructive) { trashFolder() }.pointerStyle(.link)
-            Button(L10n.text("action.cancel"), role: .cancel) { folderToTrash = nil }.pointerStyle(.link)
-        } message: {
-            folderDeleteMessage
-        }
-        .confirmationDialog(
-            L10n.text("dialog.deleteNoteTitle"),
-            isPresented: $showNoteTrashConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button(L10n.text("list.delete"), role: .destructive) { trashNote() }.pointerStyle(.link)
-            Button(L10n.text("action.cancel"), role: .cancel) { noteToTrash = nil }.pointerStyle(.link)
-        } message: {
-            noteDeleteMessage
-        }
-        .confirmationDialog(
-            L10n.text("dialog.createLinkedNoteTitle"),
-            isPresented: $showingMissingWikiLink,
-            titleVisibility: .visible
-        ) {
-            Button(L10n.text("dialog.createLinkedNoteAction")) { createMissingWikiLink() }.pointerStyle(.link)
-            Button(L10n.text("action.cancel"), role: .cancel) { pendingWikiLink = nil }.pointerStyle(.link)
-        } message: {
-            Text(verbatim: missingWikiLinkDetails)
         }
     }
 
@@ -210,6 +326,7 @@ struct ContentView: View {
                         selectedTrashID: $selectedTrashID,
                         folderDisclosureState: $folderDisclosureState,
                         query: $query,
+                        searchSelectionIndex: $searchSelectionIndex,
                         focusSearchWhenVisible: $focusSearchWhenVisible,
                         store: store,
                         chatStore: appModel.chatStore,
@@ -217,6 +334,9 @@ struct ContentView: View {
                         onToggleSidebar: toggleSidebarFromButton,
                         onSelectSection: selectSection,
                         onNewChat: createChat,
+                        onQuickOpen: { showQuickOpen = true },
+                        onMoveSearchSelection: moveSearchSelection,
+                        onSubmitSearch: openSelectedSearchResult,
                         onSelectConversation: selectChatConversation,
                         onOpenNote: openNote,
                         onOpenTrashItem: { selectedTrashID = $0.id },
@@ -260,7 +380,7 @@ struct ContentView: View {
 
     private var workspaceRoute: WorkspaceRoute {
         if showTrash { return .trash }
-        if !query.isEmpty { return .search }
+        if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .search }
         switch activeSection {
         case .tasks: return .tasks
         case .chat: return .chat
@@ -276,9 +396,10 @@ struct ContentView: View {
                     GlobalSearchBoard(
                         store: store,
                         query: query,
-                        onOpenNote: openNote,
-                        onOpenTask: openTask,
-                        onOpenEmbeddedTask: { openNote(id: $0.noteID) }
+                        selectedIndex: $searchSelectionIndex,
+                        onOpenNote: openSearchNote,
+                        onOpenTask: openSearchTask,
+                        onOpenEmbeddedTask: openSearchNote
                     )
                 case .tasks:
                     TaskBoardView(appModel: appModel, query: query, selectedTaskID: $selectedTaskID, onOpenNote: openNote)
@@ -313,8 +434,6 @@ struct ContentView: View {
         return ([root] + folderPath).joined(separator: "  /  ")
     }
 
-    private var folderDeleteMessage: some View { Text(verbatim: L10n.text("dialog.deleteFolderBody")) }
-    private var noteDeleteMessage: some View { Text(verbatim: L10n.text("dialog.deleteNoteBody")) }
 
     private var statusBannerSources: [StatusBannerSnapshot] {
         [
@@ -404,7 +523,34 @@ struct ContentView: View {
             activeSection = note.section == .wiki ? .wiki : .notes
             folderPath = note.folders
             selectedNoteID = note.id
+            appModel.currentNoteID = note.id
             folderDisclosureState.expandAncestors(section: note.section, path: note.folders)
+        }
+    }
+
+    private func syncCurrentNoteContext() {
+        if let id = selectedNoteID, store.visibleNotes.contains(where: { $0.id == id }) {
+            appModel.currentNoteID = id
+        } else if let id = appModel.currentNoteID,
+                  !store.visibleNotes.contains(where: { $0.id == id }) {
+            appModel.currentNoteID = nil
+        }
+    }
+
+    private func moveSearchSelection(_ delta: Int) {
+        let count = SearchIndex.results(query: query, store: store).count
+        guard count > 0 else { searchSelectionIndex = 0; return }
+        searchSelectionIndex = (searchSelectionIndex + delta + count) % count
+    }
+
+    private func openSelectedSearchResult() {
+        let hits = SearchIndex.results(query: query, store: store)
+        guard hits.indices.contains(searchSelectionIndex) else { return }
+        let hit = hits[searchSelectionIndex]
+        switch hit.target {
+        case .note(let id): openSearchNote(id, hit.findQuery)
+        case .task(let id): openSearchTask(id)
+        case .embeddedTask(let noteID): openSearchNote(noteID, hit.findQuery)
         }
     }
 
@@ -479,10 +625,24 @@ struct ContentView: View {
     }
 
     private func createNote() {
+        showQuickOpen = false
         do {
             let note = try store.createNote(section: currentNoteSection, folders: folderPath)
             openNote(id: note.id)
         } catch { store.report(error) }
+    }
+
+    private func createNoteFromShortcut() {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            if activeSection != .notes && activeSection != .wiki {
+                showTrash = false
+                activeSection = .notes
+                folderPath = []
+            }
+            createNote()
+        }
     }
 
     private func openNote(id: UUID) {
@@ -498,7 +658,67 @@ struct ContentView: View {
         activeSection = note.section == .wiki ? .wiki : .notes
         folderPath = note.folders
         selectedNoteID = note.id
+        appModel.currentNoteID = note.id
+        store.recordOpenedNote(note.id)
         folderDisclosureState.expandAncestors(section: note.section, path: note.folders)
+    }
+
+    private func openSearchNote(_ id: UUID, _ findQuery: String?) {
+        let alreadyVisible = appModel.editorDocumentID == id && workspaceRoute == .document
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            showQuickOpen = false
+            openNote(id: id)
+        }
+        if alreadyVisible {
+            sendSearchNavigation(documentID: id, query: findQuery)
+        } else {
+            pendingSearchNavigation = PendingSearchNavigation(documentID: id, query: findQuery)
+            dispatchPendingSearchNavigation(for: appModel.editorDocumentID)
+        }
+    }
+
+    private func dispatchPendingSearchNavigation(for editorDocumentID: UUID?) {
+        guard let pendingSearchNavigation,
+              pendingSearchNavigation.documentID == editorDocumentID,
+              selectedNoteID == pendingSearchNavigation.documentID,
+              workspaceRoute == .document else { return }
+        self.pendingSearchNavigation = nil
+        sendSearchNavigation(documentID: pendingSearchNavigation.documentID, query: pendingSearchNavigation.query)
+    }
+
+    private func sendSearchNavigation(documentID: UUID, query: String?) {
+        if let query, !query.isEmpty {
+            commandBus.send(.showFind(query: query, documentID: documentID))
+        } else {
+            commandBus.send(.focus(documentID: documentID))
+        }
+    }
+
+    private func openSearchTask(_ id: UUID) {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            showQuickOpen = false
+            openTask(id: id)
+        }
+    }
+
+    private func findInCurrentNote() {
+        guard let id = selectedNoteID,
+              let note = store.visibleNotes.first(where: { $0.id == id }) else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            showQuickOpen = false
+            showTrash = false
+            query = ""
+            activeSection = note.section == .wiki ? .wiki : .notes
+            folderPath = note.folders
+            appModel.currentNoteID = id
+            commandBus.send(.showFind(query: nil, documentID: id))
+        }
     }
 
     private func navigateBack() {
@@ -565,6 +785,7 @@ struct ContentView: View {
     }
 
     private func openTask(id: UUID) {
+        showQuickOpen = false
         showTrash = false
         query = ""
         activeSection = .tasks
@@ -641,6 +862,7 @@ private struct NavigationSidebar: View {
     @Binding var selectedTrashID: UUID?
     @Binding var folderDisclosureState: FolderDisclosureState
     @Binding var query: String
+    @Binding var searchSelectionIndex: Int
     @Binding var focusSearchWhenVisible: Bool
     let store: StillStore
     let chatStore: ChatStore
@@ -648,6 +870,9 @@ private struct NavigationSidebar: View {
     let onToggleSidebar: () -> Void
     let onSelectSection: (WorkspaceSection) -> Void
     let onNewChat: () -> Void
+    let onQuickOpen: () -> Void
+    let onMoveSearchSelection: (Int) -> Void
+    let onSubmitSearch: () -> Void
     let onSelectConversation: (UUID) -> Void
     let onOpenNote: (UUID) -> Void
     let onOpenTrashItem: (TrashEntry) -> Void
@@ -659,7 +884,7 @@ private struct NavigationSidebar: View {
     let onTrashNote: (UUID) -> Void
     let onOpenSettings: () -> Void
     let onFolderAction: (FolderAction) -> Void
-    @FocusState private var searchFocused: Bool
+    @State private var searchFocused = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -687,14 +912,34 @@ private struct NavigationSidebar: View {
 
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(.secondary)
-                TextField(L10n.text("sidebar.searchPlaceholder"), text: $query)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .focused($searchFocused)
-                    .accessibilityLabel(L10n.text(store.wikiEnabled ? "sidebar.searchAccessible" : "sidebar.searchAccessible.noWiki"))
-                    .accessibilityIdentifier("global-search")
+                SearchQueryTextField(
+                    text: $query,
+                    isFocused: searchFocusBinding,
+                    placeholder: L10n.text("sidebar.searchPlaceholder"),
+                    accessibilityLabel: L10n.text(store.wikiEnabled ? "sidebar.searchAccessible" : "sidebar.searchAccessible.noWiki"),
+                    onMove: onMoveSearchSelection,
+                    onSubmit: onSubmitSearch,
+                    onCancel: {
+                        var transaction = Transaction(animation: nil)
+                        transaction.disablesAnimations = true
+                        withTransaction(transaction) {
+                            if !query.isEmpty { query = ""; searchSelectionIndex = 0 }
+                            else { searchFocusBinding.wrappedValue = false }
+                        }
+                    }
+                )
+                .frame(height: 16)
+                Button(action: onQuickOpen) {
+                    Image(systemName: "text.magnifyingglass")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22).contentShape(Rectangle())
+                }
+                .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
+                .help(L10n.text("quickOpen.title"))
+                .accessibilityLabel(L10n.text("quickOpen.title"))
+                .accessibilityIdentifier("open-quick-open")
                 if !query.isEmpty {
-                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundStyle(.tertiary) }
+                    Button { query = ""; searchSelectionIndex = 0 } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 11)).foregroundStyle(.tertiary) }
                         .buttonStyle(CalmButtonStyle()).pointerStyle(.link).calmHover(cornerRadius: 6)
                         .accessibilityLabel(L10n.text("action.clearSearch"))
                         .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
@@ -709,6 +954,7 @@ private struct NavigationSidebar: View {
             .padding(.bottom, 20)
             .animation(reduceMotion ? nil : CalmMotion.quick, value: query.isEmpty)
             .animation(reduceMotion ? nil : CalmMotion.quick, value: searchFocused)
+        .onChange(of: query) { _, _ in searchSelectionIndex = 0 }
 
             VStack(spacing: 3) {
                 ForEach(([WorkspaceSection.tasks, .notes] + (store.wikiEnabled ? [.wiki] : []) + [.chat])) { section in
@@ -773,13 +1019,16 @@ private struct NavigationSidebar: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .frame(width: 208)
         .overlay(alignment: .trailing) { Rectangle().fill(Color.primary.opacity(0.045)).frame(width: 1) }
-        .task(id: focusSearchWhenVisible) {
-            guard focusSearchWhenVisible else { return }
-            await Task.yield()
-            guard !Task.isCancelled, focusSearchWhenVisible else { return }
-            searchFocused = true
-            focusSearchWhenVisible = false
-        }
+    }
+
+    private var searchFocusBinding: Binding<Bool> {
+        Binding(
+            get: { searchFocused || focusSearchWhenVisible },
+            set: { focused in
+                if searchFocused != focused { searchFocused = focused }
+                if focusSearchWhenVisible { focusSearchWhenVisible = false }
+            }
+        )
     }
 
     private var sidebarContentRoute: SidebarContentRoute {
@@ -840,6 +1089,25 @@ private struct NavigationSidebar: View {
 
                         ScrollView {
                             LazyVStack(alignment: .leading, spacing: 2) {
+                                if !store.favoriteNotes.isEmpty {
+                                    Text(L10n.text("quickOpen.favorites").uppercased())
+                                        .font(.system(size: 10, weight: .medium))
+                                        .tracking(0.8).foregroundStyle(.tertiary)
+                                        .padding(.leading, 10).padding(.top, 8).padding(.bottom, 3)
+                                    ForEach(store.favoriteNotes) { note in
+                                        SidebarNoteRow(note: note, isSelected: selectedNoteID == note.id, store: store,
+                                                       onOpen: { onOpenNote(note.id) }, onRename: { onRenameNote(note) },
+                                                       onMove: onMoveNote, onTrash: onTrashNote)
+                                    }
+                                    HStack(spacing: 8) {
+                                        Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5)
+                                        Text(L10n.text(activeSection == .wiki ? "nav.wiki" : "nav.notes").uppercased())
+                                            .font(.system(size: 9, weight: .medium)).tracking(0.7)
+                                            .foregroundStyle(.tertiary)
+                                        Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 0.5)
+                                    }
+                                    .padding(.horizontal, 10).padding(.top, 12).padding(.bottom, 4)
+                                }
                                 sectionItems
                             }
                             .padding(.bottom, 8)
@@ -1041,7 +1309,20 @@ private struct SidebarNoteRow: View {
             }
             .buttonStyle(CalmButtonStyle()).pointerStyle(.link)
             .accessibilityIdentifier("sidebar-note-\(note.id.uuidString)")
+            Button { store.toggleFavoriteNote(note.id) } label: {
+                Image(systemName: store.isFavoriteNote(note.id) ? "star.fill" : "star")
+                    .font(.system(size: 9)).foregroundStyle(store.isFavoriteNote(note.id) ? Color.accentColor : Color.secondary.opacity(0.55))
+                    .frame(width: 18, height: SidebarRowLayout.height).contentShape(Rectangle())
+            }
+            .buttonStyle(CalmButtonStyle()).pointerStyle(.link)
+            .opacity(isHovered || store.isFavoriteNote(note.id) ? 1 : 0)
+            .help(L10n.text(store.isFavoriteNote(note.id) ? "quickOpen.removeFavorite" : "quickOpen.addFavorite"))
+            .accessibilityLabel(L10n.text(store.isFavoriteNote(note.id) ? "quickOpen.removeFavorite" : "quickOpen.addFavorite"))
             Menu {
+                Button(L10n.text(store.isFavoriteNote(note.id) ? "quickOpen.removeFavorite" : "quickOpen.addFavorite"),
+                       systemImage: store.isFavoriteNote(note.id) ? "star.slash" : "star") {
+                    store.toggleFavoriteNote(note.id)
+                }
                 Button(L10n.text("list.rename"), systemImage: "pencil", action: onRename)
                 Menu(L10n.text("list.move"), systemImage: "folder") {
                     ForEach(Array(moveTargets.enumerated()), id: \.offset) { _, target in
@@ -1070,6 +1351,10 @@ private struct SidebarNoteRow: View {
         .animation(reduceMotion ? nil : CalmMotion.quick, value: isSelected)
         .animation(reduceMotion ? nil : CalmMotion.quick, value: isHovered)
         .contextMenu {
+            Button(L10n.text(store.isFavoriteNote(note.id) ? "quickOpen.removeFavorite" : "quickOpen.addFavorite"),
+                   systemImage: store.isFavoriteNote(note.id) ? "star.slash" : "star") {
+                store.toggleFavoriteNote(note.id)
+            }
             Button(L10n.text("list.rename"), systemImage: "pencil", action: onRename)
             Menu(L10n.text("list.move"), systemImage: "folder") {
                 ForEach(Array(moveTargets.enumerated()), id: \.offset) { _, target in

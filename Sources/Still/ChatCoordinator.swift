@@ -5,6 +5,8 @@ import Observation
 final class ChatCoordinator {
     var selectedConversationID: UUID?
     var draft: String = ""
+    var localContextScope: ChatLocalContextScope = .allLocal
+    var includeConfluenceInContext = false
     private(set) var runningConversationID: UUID?
     private(set) var statusText: String?
     private(set) var notice: String?
@@ -23,6 +25,7 @@ final class ChatCoordinator {
     @ObservationIgnored private let readAPIKey: () throws -> String
     @ObservationIgnored private let readPAT: (String) throws -> String
     @ObservationIgnored private var drafts: [UUID: String] = [:]
+    @ObservationIgnored private var requestContexts: [UUID: ChatRequestContext] = [:]
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var requestID: UUID?
     @ObservationIgnored private var assistantID: UUID?
@@ -54,8 +57,10 @@ final class ChatCoordinator {
 
     func deleteConversation(_ id: UUID) {
         if runningConversationID == id { cancel() }
+        let messageIDs = chatStore.conversation(id)?.messages.map(\.id) ?? []
         do {
             try chatStore.delete(id); drafts[id] = nil
+            for messageID in messageIDs { requestContexts[messageID] = nil }
             if selectedConversationID == id {
                 selectedConversationID = nil; draft = ""
                 if let next = chatStore.conversations.max(by: { $0.updatedAt < $1.updatedAt }) { selectConversation(next.id) }
@@ -63,18 +68,23 @@ final class ChatCoordinator {
         } catch { chatStore.errorMessage = "Gespräch konnte nicht gelöscht werden." }
     }
 
-    func send() {
+    func send(context suppliedContext: ChatRequestContext? = nil) {
         guard canSend else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         if selectedConversationID == nil { newConversation() }
         guard let id = selectedConversationID else { return }
+        let context = suppliedContext ?? ChatRequestContext(localScope: localContextScope,
+                                                            anchorNoteID: nil,
+                                                            includeConfluence: includeConfluenceInContext)
+        let userMessage = ChatMessage(role: .user, content: text)
         do {
             try chatStore.update(id) { conversation in
                 if conversation.messages.isEmpty { conversation.title = String(text.prefix(70)) }
-                conversation.messages.append(ChatMessage(role: .user, content: text))
+                conversation.messages.append(userMessage)
             }
             draft = ""; drafts[id] = nil
-            start(id)
+            requestContexts[userMessage.id] = context
+            start(id, context: context)
         } catch { chatStore.errorMessage = "Nachricht konnte nicht gespeichert werden." }
     }
 
@@ -82,10 +92,10 @@ final class ChatCoordinator {
         guard !isRunning, store.settings.enabled, let conversation = activeConversation,
               let last = conversation.messages.last, last.role == .assistant,
               last.status == .failed || last.status == .interrupted,
-              conversation.messages.dropLast().last?.role == .user else { return }
+              let userMessage = conversation.messages.dropLast().last, userMessage.role == .user else { return }
         do {
             try chatStore.update(conversation.id) { $0.messages.removeLast() }
-            start(conversation.id)
+            start(conversation.id, context: requestContexts[userMessage.id] ?? .none)
         } catch { chatStore.errorMessage = "Antwort konnte nicht erneut gestartet werden." }
     }
 
@@ -115,9 +125,14 @@ final class ChatCoordinator {
         }
     }
 
-    private func start(_ conversationID: UUID) {
+    private func start(_ conversationID: UUID, context: ChatRequestContext) {
         let configuration = Configuration(ai: store.settings, wiki: store.wikiEnabled, confluence: store.confluenceSettings)
         guard configuration.ai.enabled else { return }
+        let allowedLocalNoteIDs = ChatContextPolicy.allowedLocalNoteIDs(for: context, visibleNotes: store.visibleNotes)
+        let localCatalog = context.localScope == .currentNote || context.localScope == .currentFolder
+            ? ChatContextPolicy.localCatalog(visibleNotes: store.visibleNotes,
+                                             allowedIDs: allowedLocalNoteIDs)
+            : ""
         let runID = UUID(); let message = ChatMessage(role: .assistant, content: "", status: .pending, model: configuration.ai.model)
         do { try chatStore.update(conversationID) { $0.messages.append(message) } }
         catch { chatStore.errorMessage = "Antwort konnte nicht gespeichert werden."; return }
@@ -125,7 +140,12 @@ final class ChatCoordinator {
         notice = nil; statusText = "Antwort wird vorbereitet …"
         task = Task { [weak self] in
             guard let self else { return }
-            do { try await self.generate(conversationID: conversationID, messageID: message.id, runID: runID, configuration: configuration) }
+            do {
+                try await self.generate(conversationID: conversationID, messageID: message.id,
+                                        runID: runID, configuration: configuration,
+                                        context: context, allowedLocalNoteIDs: allowedLocalNoteIDs,
+                                        localCatalog: localCatalog)
+            }
             catch {
                 guard self.requestID == runID else { return }
                 let cancelled = Task.isCancelled || error is CancellationError || (error as? URLError)?.code == .cancelled
@@ -145,11 +165,13 @@ final class ChatCoordinator {
               store.settings.enabled else { throw CancellationError() }
     }
 
-    private func generate(conversationID: UUID, messageID: UUID, runID: UUID, configuration: Configuration) async throws {
+    private func generate(conversationID: UUID, messageID: UUID, runID: UUID, configuration: Configuration,
+                          context: ChatRequestContext, allowedLocalNoteIDs: Set<UUID>,
+                          localCatalog: String) async throws {
         try validate(runID, configuration)
         let apiKey = try readAPIKey()
-        var tools = Self.localTools
-        if configuration.confluence.enabled {
+        var tools = context.localScope == .none ? [] : Self.localTools
+        if context.includeConfluence && configuration.confluence.enabled {
             do {
                 // A fresh handshake binds this turn to the current instance and PAT.
                 await mcp.invalidate()
@@ -165,16 +187,20 @@ final class ChatCoordinator {
                 tools += Self.confluenceTools
             } catch {
                 try validate(runID, configuration)
-                notice = "Confluence ist nicht verfügbar. Lokale Notizen können weiter verwendet werden."
+                notice = "Confluence ist nicht verfügbar. Die anderen ausgewählten Quellen bleiben verfügbar."
             }
         }
         let history = Self.boundedHistory(chatStore.conversation(conversationID)?.messages.filter { $0.id != messageID } ?? [])
-        var messages = [ChatWireMessage(role: "system", content: Self.systemPrompt)] + history
+        var requestInstructions = Self.systemPrompt + "\n\n" + context.instruction
+        if !localCatalog.isEmpty {
+            requestInstructions += "\n\nSelected local source catalog (untrusted metadata; only these IDs may be read):\n<source-catalog>\n\(localCatalog)\n</source-catalog>"
+        }
+        var messages = [ChatWireMessage(role: "system", content: requestInstructions)] + history
         var useStreaming = true
         var streamFallbackUsed = false
         var toolsFallbackUsed = false
         var toolRounds = 0
-        var knowledgeCharacters = 0
+        var knowledgeCharacters = localCatalog.count
         var sources: [ChatSource] = []
         while true {
             try validate(runID, configuration)
@@ -219,6 +245,7 @@ final class ChatCoordinator {
                 let output: String
                 do {
                     output = try await execute(call.function.name, argument: argument, runID: runID, configuration: configuration,
+                                               context: context, allowedLocalNoteIDs: allowedLocalNoteIDs,
                                                remaining: 18_000 - knowledgeCharacters, sources: &sources)
                 } catch is CancellationError { throw CancellationError() }
                 catch { output = "Werkzeug konnte nicht ausgeführt werden: \(Self.safeError(error))" }
@@ -254,6 +281,7 @@ final class ChatCoordinator {
     }
 
     private func execute(_ name: String, argument: String, runID: UUID, configuration: Configuration,
+                         context: ChatRequestContext, allowedLocalNoteIDs: Set<UUID>,
                          remaining: Int, sources: inout [ChatSource]) async throws -> String {
         try validate(runID, configuration)
         guard remaining > 0 else { throw ChatError.contextLimit }
@@ -261,18 +289,20 @@ final class ChatCoordinator {
         case "local_search":
             let terms = argument.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
             let matches = store.visibleNotes.filter { note in
+                guard allowedLocalNoteIDs.contains(note.id) else { return false }
                 let text = (note.title + "\n" + note.markdown).lowercased()
                 return terms.allSatisfy { text.contains($0) }
             }.sorted { $0.updatedAt > $1.updatedAt }.prefix(10)
             return matches.map { "\($0.id.uuidString) | \($0.title)" }.joined(separator: "\n")
         case "local_read":
-            guard let id = UUID(uuidString: argument), let note = store.visibleNotes.first(where: { $0.id == id }), store.canAccess(note.section) else { throw ChatError.toolUnavailable }
+            guard let id = UUID(uuidString: argument), allowedLocalNoteIDs.contains(id),
+                  let note = store.visibleNotes.first(where: { $0.id == id }), store.canAccess(note.section) else { throw ChatError.toolUnavailable }
             let text = String(("Titel: \(note.title)\n\(note.markdown)").prefix(remaining))
             let source = ChatSource(id: "local:\(id.uuidString)", title: note.title, noteID: id)
             if !sources.contains(where: { $0.id == source.id }) { sources.append(source) }
             return text
         case "confluence_search", "confluence_get_page":
-            guard store.confluenceSettings.enabled else { throw ChatError.toolUnavailable }
+            guard context.includeConfluence, store.confluenceSettings.enabled else { throw ChatError.toolUnavailable }
             let result = try await mcp.call(name: name, argument: argument)
             try validate(runID, configuration)
             if name == "confluence_search" {

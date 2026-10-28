@@ -23,7 +23,12 @@ struct StillApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1220, height: 820)
         .commands {
-            CommandGroup(replacing: .newItem) {}
+            CommandGroup(replacing: .newItem) {
+                Button(L10n.text("list.newNote")) {
+                    NotificationCenter.default.post(name: .stillCreateNote, object: nil)
+                }
+                .keyboardShortcut("n", modifiers: .command)
+            }
             CommandGroup(replacing: .undoRedo) {
                 Button(L10n.text("action.undo")) {
                     if !editorCommands.undoIfEditorFocused() {
@@ -40,10 +45,21 @@ struct StillApp: App {
                 .keyboardShortcut("z", modifiers: [.command, .shift])
             }
             CommandGroup(after: .textEditing) {
-                Button(L10n.text("nav.search")) {
-                    NotificationCenter.default.post(name: .stillFocusSearch, object: nil)
+                Button(L10n.text("quickOpen.title")) {
+                    NotificationCenter.default.post(name: .stillQuickOpen, object: nil)
+                }
+                .keyboardShortcut("k", modifiers: .command)
+
+                Button(L10n.text("editor.find")) {
+                    NotificationCenter.default.post(name: .stillShowFind, object: nil)
                 }
                 .keyboardShortcut("f", modifiers: .command)
+                .disabled(appModel.editorDocumentID == nil)
+
+                Button(L10n.text("nav.search")) {
+                    NotificationCenter.default.post(name: .stillFocusSearch, object: NSApp.keyWindow ?? NSApp.mainWindow)
+                }
+                .keyboardShortcut("f", modifiers: [.command, .option])
 
                 Button(L10n.text("nav.back")) {
                     NotificationCenter.default.post(name: .stillNavigateBack, object: nil)
@@ -63,8 +79,37 @@ struct StillApp: App {
 
 @MainActor
 final class StillAppDelegate: NSObject, NSApplicationDelegate {
+    private var searchShortcutMonitor: Any?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        searchShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let handled = MainActor.assumeIsolated { GlobalSearchShortcut.handle(event) }
+            return handled ? nil : event
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let searchShortcutMonitor { NSEvent.removeMonitor(searchShortcutMonitor) }
+        searchShortcutMonitor = nil
+    }
+}
+
+@MainActor
+enum GlobalSearchShortcut {
+    static let mainWindowFrameAutosaveName = "StillMainWindow"
+
+    static func handle(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard event.type == .keyDown, modifiers == [.command, .option],
+              event.charactersIgnoringModifiers?.lowercased() == "f",
+              let window = event.window ?? NSApp.keyWindow ?? NSApp.mainWindow,
+              window.frameAutosaveName == mainWindowFrameAutosaveName,
+              window.attachedSheet == nil, NSApp.modalWindow == nil else { return false }
+        // SwiftUI menu actions can arrive after the next key. Route this shortcut
+        // while AppKit is still dispatching its original key-down event.
+        NotificationCenter.default.post(name: .stillFocusSearch, object: window)
+        return true
     }
 }
 
@@ -72,6 +117,9 @@ extension Notification.Name {
     static let stillFocusSearch = Notification.Name("still.focusSearch")
     static let stillToggleSidebar = Notification.Name("still.toggleSidebar")
     static let stillNavigateBack = Notification.Name("still.navigateBack")
+    static let stillQuickOpen = Notification.Name("still.quickOpen")
+    static let stillShowFind = Notification.Name("still.showFind")
+    static let stillCreateNote = Notification.Name("still.createNote")
 }
 
 struct WindowConfigurator: NSViewRepresentable {
@@ -99,7 +147,7 @@ struct WindowConfigurator: NSViewRepresentable {
         window.isMovableByWindowBackground = false
         window.tabbingMode = .disallowed
         window.minSize = NSSize(width: 960, height: 640)
-        window.setFrameAutosaveName("StillMainWindow")
+        window.setFrameAutosaveName(GlobalSearchShortcut.mainWindowFrameAutosaveName)
     }
 }
 

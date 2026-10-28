@@ -21,7 +21,8 @@ enum L10n {
             "editor.selectionToolbar", "editor.busy", "editor.openLink", "editor.table",
             "editor.linkOpenNote", "editor.linkOpenWiki", "editor.linkCreateMissing",
             "editor.linkAmbiguous", "editor.linkExternal", "editor.linkSectionNotes",
-            "editor.linkSectionWiki"
+            "editor.linkSectionWiki", "editor.findPlaceholder", "editor.findPrevious",
+            "editor.findNext", "editor.findClose", "editor.findOf"
         ]
         return Dictionary(uniqueKeysWithValues: keys.map { ($0, text($0)) })
     }

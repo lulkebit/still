@@ -196,6 +196,37 @@ final class ChatBackendTests: XCTestCase {
         XCTAssertFalse(bytes.contains("tool_calls")); XCTAssertFalse(bytes.contains(String(repeating: "Beleg ", count: 100)))
     }
 
+    func testCurrentNoteScopeGuardsSearchAndRejectsOutOfScopeLocalRead() async throws {
+        let client = ScriptedChatClient(steps: [
+            .tool("local_search", #"{"query":"Allowed"}"#),
+            .tool("local_read", "PLACEHOLDER"),
+            .text("Antwort ohne Zugriff auf die andere Notiz")
+        ])
+        let (store, chats, coordinator) = try setup(client)
+        let allowed = try store.createNote(section: .notes, title: "Allowed source", markdown: "Allowed body")
+        let outside = try store.createNote(section: .notes, title: "Outside source", markdown: "OUT_OF_SCOPE_PRIVATE_SENTINEL")
+        await client.replaceArguments(at: 1, with: "{\"noteID\":\"\(outside.id.uuidString)\"}")
+
+        coordinator.draft = "Fasse die aktuelle Notiz zusammen"
+        coordinator.send(context: ChatRequestContext(localScope: .currentNote,
+                                                     anchorNoteID: allowed.id,
+                                                     includeConfluence: false))
+        try await finished(coordinator)
+
+        let answer = try XCTUnwrap(chats.conversations.first?.messages.last)
+        XCTAssertEqual(answer.status, .complete)
+        XCTAssertTrue(answer.sources.isEmpty, "An out-of-scope read must not be recorded as a source")
+        let calls = await client.captures
+        XCTAssertEqual(calls.first?.tools.count, 2)
+        XCTAssertTrue(calls.first?.messages.first?.content?.contains(allowed.id.uuidString) == true)
+        XCTAssertTrue(calls.first?.messages.first?.content?.contains(allowed.title) == true)
+        XCTAssertFalse(calls.first?.messages.first?.content?.contains(outside.id.uuidString) == true)
+        XCTAssertFalse(calls.first?.messages.first?.content?.contains(outside.title) == true)
+        XCTAssertTrue(calls[1].messages.last?.content?.contains(allowed.title) == true)
+        XCTAssertFalse(calls[1].messages.last?.content?.contains(outside.title) == true)
+        XCTAssertFalse(calls[2].messages.last?.content?.contains("OUT_OF_SCOPE_PRIVATE_SENTINEL") == true)
+    }
+
     func testSearchOnlyHasNoSourcesAndHiddenWikiCannotBeRead() async throws {
         let client = ScriptedChatClient(steps: [.tool("local_search", #"{"query":"Hidden"}"#), .text("Keine Quelle")])
         let (store, chats, coordinator) = try setup(client)

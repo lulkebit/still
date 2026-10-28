@@ -81,6 +81,9 @@ struct EditorCommand: Identifiable {
     enum Kind {
         case insertMarkdown(String, documentID: UUID)
         case insertImage(url: String, alt: String, documentID: UUID)
+        case showFind(query: String?, documentID: UUID)
+        case focus(documentID: UUID)
+        case replaceSelection(original: String, replacement: String, range: NSRange, documentID: UUID)
     }
 
     var id = UUID()
@@ -88,7 +91,9 @@ struct EditorCommand: Identifiable {
 
     var documentID: UUID {
         switch kind {
-        case .insertMarkdown(_, let documentID), .insertImage(_, _, let documentID): documentID
+        case .insertMarkdown(_, let documentID), .insertImage(_, _, let documentID),
+             .showFind(_, let documentID), .focus(let documentID),
+             .replaceSelection(_, _, _, let documentID): documentID
         }
     }
 
@@ -104,6 +109,8 @@ final class EditorCommandBus {
     private var redoHandler: (() -> Void)?
     private var commandHandler: ((EditorCommand) -> Bool)?
     @ObservationIgnored private var activeSessionID: UUID?
+
+    var hasActiveEditor: Bool { activeSessionID != nil }
 
     func send(_ kind: EditorCommand.Kind) {
         let command = EditorCommand(kind: kind)
@@ -150,14 +157,16 @@ final class EditorCommandBus {
         commandHandler = command
     }
 
-    func clearSession(ownerID: UUID) {
-        guard activeSessionID == ownerID else { return }
+    @discardableResult
+    func clearSession(ownerID: UUID) -> Bool {
+        guard activeSessionID == ownerID else { return false }
         activeSessionID = nil
         editorFocused = false
         undoHandler = nil
         redoHandler = nil
         commandHandler = nil
         pending = nil
+        return true
     }
 
     @discardableResult
@@ -275,13 +284,18 @@ struct MarkdownEditor: NSViewRepresentable {
             if commandBus !== commands {
                 commandBus?.clearSession(ownerID: commandSessionID)
                 commandBus = commands
+                appModel.editorCommands = commands
                 commands.activateSession(ownerID: commandSessionID,
                     undo: { [weak self] in self?.invoke("undo", payload: [:]) },
                     redo: { [weak self] in self?.invoke("redo", payload: [:]) },
                     command: { [weak self] command in self?.dispatch(command) ?? false }
                 )
             }
-            guard let note, webView != nil else { return }
+            guard let note, webView != nil else {
+                appModel.editorDocumentDidChange(nil)
+                currentDocumentID = nil
+                return
+            }
             guard appModel.store.canAccess(note.section) else { return }
             if currentDocumentID != note.id {
                 commands.setEditorFocused(false, ownerID: commandSessionID)
@@ -292,6 +306,7 @@ struct MarkdownEditor: NSViewRepresentable {
             let documentChanged = currentDocumentID != note.id || pushedMarkdown != note.markdown
             let appearanceChanged = currentTheme != theme || currentReduceMotion != reduceMotion
             let availabilityChanged = currentAIAvailable != aiAvailable || currentWikiAvailable != wikiAvailable
+            if currentDocumentID != note.id { appModel.editorDocumentDidChange(note.id) }
             currentDocumentID = note.id
             if lastLinkCatalogRevision != appModel.store.linkCatalogRevision {
                 lastLinkDocuments = appModel.store.visibleNotes.map(EditorLinkDocument.init(note:))
@@ -377,6 +392,8 @@ struct MarkdownEditor: NSViewRepresentable {
                 importImage(body)
             case "toggleSidebar":
                 NotificationCenter.default.post(name: .stillToggleSidebar, object: nil)
+            case "quickOpen":
+                NotificationCenter.default.post(name: .stillQuickOpen, object: nil)
             default:
                 break
             }
@@ -394,8 +411,13 @@ struct MarkdownEditor: NSViewRepresentable {
         func detach() {
             isDetached = true
             appModel.store.flushPendingWrites()
-            commandBus?.clearSession(ownerID: commandSessionID)
+            let didClearActiveSession = commandBus?.clearSession(ownerID: commandSessionID) == true
+            if didClearActiveSession {
+                appModel.editorCommands = nil
+                appModel.editorDocumentDidChange(nil)
+            }
             commandBus = nil
+            currentDocumentID = nil
             webView = nil
         }
 
@@ -413,6 +435,26 @@ struct MarkdownEditor: NSViewRepresentable {
                     guard !inserted else { return }
                     Task { @MainActor [weak self] in self?.appModel.store.report(StoreError.imageInsertFailed) }
                 }
+            case .showFind(let query, let documentID):
+                if let webView { webView.window?.makeFirstResponder(webView) }
+                invoke("showFind", payload: ["id": documentID.uuidString, "query": query as Any? ?? NSNull()])
+            case .focus:
+                if let webView { webView.window?.makeFirstResponder(webView) }
+                invoke("focus", payload: [:])
+            case .replaceSelection(let original, let replacement, let range, let documentID):
+                invoke("replaceSelection", payload: [
+                    "id": documentID.uuidString,
+                    "from": range.location,
+                    "to": NSMaxRange(range),
+                    "original": original,
+                    "replacement": replacement
+                ]) { [weak self] value, _ in
+                    let replaced = (value as? NSNumber)?.boolValue == true
+                    guard !replaced else { return }
+                    Task { @MainActor [weak self] in
+                        self?.appModel.aiError = L10n.text("error.aiSelectionChanged")
+                    }
+                }
             }
             return true
         }
@@ -420,6 +462,15 @@ struct MarkdownEditor: NSViewRepresentable {
         private func perform(action: String, id: UUID, text: String, from: Int, to: Int) async {
             guard appModel.store.visibleNotes.contains(where: { $0.id == id }),
                   action != "wiki" || appModel.store.wikiEnabled else {
+                setAIState(busy: false, label: nil)
+                return
+            }
+            if action == "optimize" {
+                guard let note = appModel.store.visibleNotes.first(where: { $0.id == id }) else { return }
+                let range = NSRange(location: from, length: to - from)
+                _ = appModel.beginAIReview(target: .note(id), originalDocument: note.markdown,
+                                           selectedText: text, range: range)
+                lastAIState = nil
                 setAIState(busy: false, label: nil)
                 return
             }

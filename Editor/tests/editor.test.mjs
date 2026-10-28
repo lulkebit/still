@@ -51,6 +51,47 @@ test('source fidelity, active syntax and live styled typography',async()=>{
   assert.ok(!(await page.locator('.cm-content').textContent()).includes('**bold**'));
   assert.equal(await source(),markdown);
 });
+test('document find folds accents, highlights the active hit, navigates, closes and resets on document switch',async()=>{
+  const markdown='Café café Cafe\u0301 CAFE';
+  await load(markdown,'find-doc');await select(2,4);
+  const originalSelection=await page.locator('.cm-content').evaluate(content=>{const range=content.cmTile.root.view.state.selection.main;return{from:range.from,to:range.to};});
+  assert.equal(await page.evaluate(()=>window.stillEditor.showFind({id:'find-doc',query:'cafe'})),true);
+  assert.equal(await page.locator('.still-find-bar').isVisible(),true);
+  await page.waitForFunction(()=>document.querySelectorAll('.cm-find-match').length===4);
+  assert.equal(await page.locator('.still-find-count').textContent(),'1 of 4');
+  assert.equal(await page.locator('.cm-find-match-active').count(),1);
+  assert.deepEqual(await page.locator('.cm-content').evaluate(content=>{const range=content.cmTile.root.view.state.selection.main;return{from:range.from,to:range.to};}),originalSelection,'Find does not replace or move the editor selection');
+  await page.keyboard.press('Enter');assert.equal(await page.locator('.still-find-count').textContent(),'2 of 4');
+  await page.keyboard.press('Shift+Enter');assert.equal(await page.locator('.still-find-count').textContent(),'1 of 4');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('.still-find-bar').isVisible(),false);
+  assert.equal(await page.locator('.cm-find-match').count(),0,'Closing find clears its marks');
+  assert.equal(await page.locator('.cm-content').evaluate(content=>content.cmTile.root.view.hasFocus),true,'Escape returns focus to the document');
+  await select(markdown.length);
+  await page.evaluate(()=>window.stillEditor.showFind({id:'find-doc'}));
+  assert.equal(await page.locator('.still-find-input').inputValue(),'cafe','Cmd-F without a new query reuses the last find term');
+  await page.keyboard.press('Escape');
+
+  const folded='Intro\n\n| Name | Value |\n| --- | --- |\n| Café | 4 |\n\n<details><summary>Details</summary>\n\nSecret café reference\n\n</details>';
+  await load(folded,'find-folded');
+  assert.equal(await page.locator('.md-table-wrap').count(),1);
+  assert.equal(await page.locator('.md-disclosure').count(),1);
+  await page.evaluate(()=>window.stillEditor.showFind({id:'find-folded',query:'Café'}));
+  await page.waitForFunction(()=>document.querySelector('.still-find-count').textContent==='1 of 2');
+  assert.equal(await page.locator('.cm-find-match').count(),1,'Only the active source match is mounted while the other is folded');
+  assert.equal(await page.locator('.md-table-wrap').count(),0,'Finding inside a table reveals its Markdown source');
+  assert.equal(await page.locator('.md-disclosure').count(),1,'The active table match does not unfold unrelated details');
+  await page.evaluate(()=>window.stillEditor.showFind({id:'find-folded',query:'Secret'}));
+  await page.waitForFunction(()=>document.querySelectorAll('.cm-find-match').length===1);
+  assert.equal(await page.locator('.md-disclosure').count(),0,'Finding inside closed details reveals the matching source lines');
+  assert.equal(await page.locator('.cm-find-match').textContent(),'Secret');
+
+  await page.evaluate(()=>window.stillEditor.setDocument({id:'find-next',markdown:'A different note'}));
+  assert.equal(await page.locator('.still-find-bar').isVisible(),false,'Switching notes closes the find bar');
+  assert.equal(await page.locator('.cm-find-match').count(),0,'Find decorations do not leak into the next note');
+  assert.equal(await page.evaluate(()=>window.stillEditor.showFind({id:'find-doc',query:'cafe'})),false,'A stale document request cannot open find in another note');
+  assert.equal(await page.locator('.still-find-bar').isVisible(),false);
+});
 test('blur previews all syntax and refocus restores caret, selection and undo',async()=>{
   const markdown='## Zweck\n\n**bold** text\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n\n<details><summary>More</summary>\n\nHidden detail\n\n</details>';
   await load(markdown,'focus-doc');await select(0,8);
@@ -220,8 +261,18 @@ test('heading, quote and link actions are source edits',async()=>{
   await page.locator('[data-action=quote]').click();
   assert.equal(await source(),'> Some text\nOther line');
   await page.keyboard.press('Meta+z');await select(0,9);
-  await page.keyboard.press('Meta+k');
+  await page.keyboard.press('Meta+Shift+k');
   assert.equal(await source(),'[Some text](https://)\nOther line');
+});
+test('Cmd-K opens native Quick Open without editing and Cmd-Shift-K inserts a link',async()=>{
+  await load('Selected text','quick-open-shortcut');await select(0,8);
+  const history=await page.evaluate(()=>window.stillEditor.historyState());
+  await page.keyboard.press('Meta+k');
+  assert.equal(await source(),'Selected text');
+  assert.deepEqual(await page.evaluate(()=>window.messages.filter(message=>message.type==='quickOpen').at(-1)),{type:'quickOpen'});
+  assert.deepEqual(await page.evaluate(()=>window.stillEditor.historyState()),history);
+  await page.keyboard.press('Meta+Shift+k');
+  assert.equal(await source(),'[Selected](https://) text');
 });
 test('checkbox transactions are undoable without moving the cursor',async()=>{
   await load('Intro\n\n- [ ] A task\n\nTail');

@@ -34,6 +34,20 @@ AI is off by default. Add an HTTPS OpenAI-compatible endpoint (or a local HTTP e
 
 Markdown is stored as plain `.md` files. Images imported through the editor are saved in the workspace’s `attachments` folder.
 
+## Finding notes and tasks
+
+Press ⌘K to open the quick switcher. With no query it shows favorites and recently opened notes; typing searches visible notes, Wiki pages, and tasks. Title matches appear first, and matching text excerpts help identify content results. Use the arrow keys and Return to open a result, or Escape to close the switcher. Stars in the sidebar and switcher add or remove favorites. Favorites and the twelve most recently opened notes are saved locally across restarts.
+
+Press ⌘F to find text inside the open note. The find bar shows the current match and total count, supports previous/next navigation, and closes with Escape. Opening a content result from global search or the switcher reveals a matching passage. Press ⌥⌘F to focus global search, or ⌘N to create a new note in the current notes/Wiki folder. From Tasks or Chat, ⌘N creates a regular note. In the editor, ⇧⌘K inserts a Markdown link; ⌘K always opens the quick switcher.
+
+## Focused tasks
+
+The task board has All, Today, Upcoming, and Waiting views. Today includes open tasks due today or overdue; Upcoming includes open tasks due on a later calendar day. Waiting tasks have their own view. Undated tasks and note checklists remain available under All. Completed tasks and checklist items start in a collapsed section and can be reopened. Overdue dates have a quiet visual indicator.
+
+## Reviewing AI edits
+
+Optimize opens a review sheet before sending a request. Choose the current note, its folder, specific visible notes/Wiki pages, or no additional context. The sheet then shows the original selection and proposed replacement side by side. Accept applies the replacement as one undoable edit; Discard leaves the source unchanged and cancels pending generation. A proposal is rejected if its source or relevant settings have changed.
+
 ## Links between notes
 
 Type `[[Page title]]` to link a note or Wiki page; `[[Page title|label]]` displays a custom label. The editor offers matching notes while you type. Use a full target such as `[[wiki/Guides/Getting started]]` when titles are ambiguous. Press ⌘-click or ⌘↩ on a link to open it; a missing target can be created in the current section and folder. Links to external HTTP(S) and email addresses open in the default app. The editor shows backlinks below the note, and ⌘[ returns to the previous note. Link targets are updated when a linked note or folder is renamed or moved.
@@ -47,6 +61,8 @@ Copyright (C) 2026 Luke Schröter. `still` is licensed under the GNU General Pub
 Chat keeps multiple named conversations locally in `conversations.json` in the same workspace as notes. Streaming replies are saved periodically and flushed when the app becomes inactive or exits. Interrupted replies remain readable and can be retried without duplicating the question. Switching conversations keeps the request running; deleting its conversation, changing settings, or disabling AI cancels it. Chat history remains readable while AI is off.
 
 Chat uses the selected OpenAI-compatible model and endpoint. It can search and read currently visible local notes and Wiki pages. Disabling Wiki keeps its files but excludes them from navigation and new AI context. Conversation history may still contain previously generated answers and source titles. Read source contents are untrusted reference data; tool payloads and credentials are never stored in conversations. Requests use up to six tool rounds, 18,000 characters of knowledge per turn, and 60,000 characters of recent conversation history, preserving whole turns. Questions are limited to 30,000 characters.
+
+The Chat composer lets you limit new local knowledge to all visible notes, the last opened note, its folder, or none. Confluence is a separate opt-in source for each request. These choices restrict both search and document reads. Changing the source selection does not remove content already present in the conversation history.
 
 Confluence is optional. Configure an HTTPS Confluence Data Center base URL (including its context path, for example `https://wiki.example.org/confluence`) and a Personal Access Token in Settings. Loopback HTTP is supported for development. Tokens are stored in Keychain separately for each normalized instance. Disabling Confluence keeps its token; the explicit remove action deletes it. Connection testing verifies an authenticated current user. Only read-only search and current-page retrieval are available, with a maximum of ten search results. Redirects are refused so credentials cannot leave the configured instance.
 

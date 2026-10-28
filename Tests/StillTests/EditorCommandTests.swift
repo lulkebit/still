@@ -68,6 +68,32 @@ final class EditorCommandTests: XCTestCase {
     }
 
     @MainActor
+    func testFindCommandTargetsTheActiveDocumentAndEditorSession() {
+        let bus = EditorCommandBus()
+        let sessionID = UUID()
+        let documentID = UUID()
+        var delivered: EditorCommand?
+        XCTAssertFalse(bus.hasActiveEditor)
+        bus.activateSession(ownerID: sessionID, undo: {}, redo: {}, command: { command in
+            delivered = command
+            return true
+        })
+
+        bus.send(.showFind(query: "quiet search", documentID: documentID))
+
+        XCTAssertTrue(bus.hasActiveEditor)
+        XCTAssertEqual(delivered?.documentID, documentID)
+        if case .showFind(let query, let targetID)? = delivered?.kind {
+            XCTAssertEqual(query, "quiet search")
+            XCTAssertEqual(targetID, documentID)
+        } else {
+            XCTFail("Expected the Find command")
+        }
+        XCTAssertTrue(bus.clearSession(ownerID: sessionID))
+        XCTAssertFalse(bus.hasActiveEditor)
+    }
+
+    @MainActor
     func testStaleSessionCleanupCannotClearCurrentHandlersOrPendingCommand() throws {
         let bus = EditorCommandBus()
         let oldSessionID = UUID()

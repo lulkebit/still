@@ -14,9 +14,110 @@ const localizedExtension = new Compartment();
 let stableSelection = null, suppressedSelection = null, toolbarFrame = 0;
 const pendingImages = new Map();
 let aiPendingPlugin=null;
-const fallback = {bold:'Bold', italic:'Italic', strikethrough:'Strikethrough', heading1:'Heading 1', heading2:'Heading 2', quote:'Quote', code:'Code', link:'Link', wikiAction:'Wiki', optimizeAction:'Optimize', editSource:'Edit source', importImage:'Import image', selectionToolbar:'Text formatting', busy:'Working…', imageAlt:'Image', table:'Table', linkOpenNote:'Notiz öffnen', linkOpenWiki:'Wiki-Seite öffnen', linkCreateMissing:'Nicht gefunden – mit ⌘-Klick erstellen', linkAmbiguous:'Mehrdeutiger Link', linkExternal:'Externen Link öffnen', linkSectionNotes:'Notizen', linkSectionWiki:'Wiki'};
+let findBarOpen=false,lastFindQuery='';
+const fallback = {bold:'Bold', italic:'Italic', strikethrough:'Strikethrough', heading1:'Heading 1', heading2:'Heading 2', quote:'Quote', code:'Code', link:'Link', wikiAction:'Wiki', optimizeAction:'Optimize', editSource:'Edit source', importImage:'Import image', selectionToolbar:'Text formatting', busy:'Working…', imageAlt:'Image', table:'Table', linkOpenNote:'Notiz öffnen', linkOpenWiki:'Wiki-Seite öffnen', linkCreateMissing:'Nicht gefunden – mit ⌘-Klick erstellen', linkAmbiguous:'Mehrdeutiger Link', linkExternal:'Externen Link öffnen', linkSectionNotes:'Notizen', linkSectionWiki:'Wiki', findPlaceholder:'Im Dokument suchen …', findPrevious:'Vorheriger Treffer', findNext:'Nächster Treffer', findClose:'Suche schließen', findOf:'%d of %d'};
 const tr = key => strings['editor.' + key] || fallback[key] || key;
 const post = message => window.webkit?.messageHandlers?.still?.postMessage(message);
+const findBar=document.createElement('div');findBar.className='still-find-bar';findBar.hidden=true;findBar.setAttribute('role','search');findBar.setAttribute('aria-label',tr('findPlaceholder'));
+const findInput=document.createElement('input');findInput.className='still-find-input';findInput.type='search';findInput.autocomplete='off';findInput.spellcheck=false;
+const findCount=document.createElement('span');findCount.className='still-find-count';findCount.setAttribute('aria-live','polite');findCount.setAttribute('aria-atomic','true');
+const findPrevious=document.createElement('button');findPrevious.className='still-find-button';findPrevious.type='button';findPrevious.textContent='↑';
+const findNext=document.createElement('button');findNext.className='still-find-button';findNext.type='button';findNext.textContent='↓';
+const findClose=document.createElement('button');findClose.className='still-find-button still-find-close';findClose.type='button';findClose.textContent='×';
+findBar.append(findInput,findCount,findPrevious,findNext,findClose);document.body.append(findBar);
+function localizeFindBar(){
+  findInput.placeholder=tr('findPlaceholder');findInput.setAttribute('aria-label',tr('findPlaceholder'));
+  findBar.setAttribute('aria-label',tr('findPlaceholder'));
+  findPrevious.title=tr('findPrevious');findPrevious.setAttribute('aria-label',tr('findPrevious'));
+  findNext.title=tr('findNext');findNext.setAttribute('aria-label',tr('findNext'));
+  findClose.title=tr('findClose');findClose.setAttribute('aria-label',tr('findClose'));
+}
+localizeFindBar();
+const setFindQueryEffect=StateEffect.define();
+const moveFindEffect=StateEffect.define();
+function foldForSearch(value) {
+  return value.normalize('NFD').replace(/\p{M}/gu,'').toLowerCase();
+}
+function findRanges(doc,query) {
+  if(!query)return [];
+  const source=doc.toString(),folded=[] , positions=[];
+  for(let offset=0;offset<source.length;) {
+    const codePoint=source.codePointAt(offset),character=String.fromCodePoint(codePoint),end=offset+character.length;
+    const foldedCharacter=foldForSearch(character);
+    for(let index=0;index<foldedCharacter.length;index++) {
+      folded.push(foldedCharacter[index]);positions.push({from:offset,to:end});
+    }
+    if(!foldedCharacter&&positions.length&&/\p{M}/u.test(character))positions[positions.length-1].to=end;
+    offset=end;
+  }
+  const normalizedQuery=foldForSearch(query),normalizedSource=folded.join('');
+  if(!normalizedQuery)return [];
+  const ranges=[];let start=0;
+  while(start<=normalizedSource.length-normalizedQuery.length) {
+    const match=normalizedSource.indexOf(normalizedQuery,start);
+    if(match<0)break;
+    const first=positions[match],last=positions[match+normalizedQuery.length-1];
+    if(first&&last)ranges.push({from:first.from,to:last.to});
+    start=match+Math.max(1,normalizedQuery.length);
+  }
+  return ranges;
+}
+const findField=StateField.define({
+  create:()=>({query:'',matches:[],activeIndex:0}),
+  update(value,transaction) {
+    let query=value.query,activeIndex=value.activeIndex,refresh=transaction.docChanged;
+    for(const effect of transaction.effects) {
+      if(effect.is(setFindQueryEffect)){query=effect.value;activeIndex=0;refresh=true;}
+      else if(effect.is(moveFindEffect)&&value.matches.length)activeIndex=(activeIndex+effect.value+value.matches.length)%value.matches.length;
+    }
+    if(refresh){const matches=findRanges(transaction.state.doc,query);return {query,matches,activeIndex:matches.length?activeIndex%matches.length:0};}
+    return activeIndex===value.activeIndex?value:{...value,activeIndex};
+  },
+  provide:field=>EditorView.decorations.from(field,result=>Decoration.set(result.matches.map((range,index)=>Decoration.mark({class:index===result.activeIndex?'cm-find-match cm-find-match-active':'cm-find-match'}).range(range.from,range.to)),true))
+});
+function setFindQuery(query,remember=true) {
+  if(remember)lastFindQuery=query;
+  view.dispatch({effects:setFindQueryEffect.of(query)});
+  updateFindCount();
+  scrollToActiveFindMatch();
+}
+function updateFindCount() {
+  const result=view.state.field(findField),current=result.matches.length?result.activeIndex+1:0;
+  findCount.textContent=tr('findOf').replace('%d',String(current)).replace('%d',String(result.matches.length));
+}
+function scrollToActiveFindMatch() {
+  const result=view.state.field(findField),match=result.matches[result.activeIndex];
+  if(match)view.dispatch({effects:EditorView.scrollIntoView(match.from,{y:'center'}),annotations:Transaction.addToHistory.of(false)});
+}
+function moveFind(direction) {
+  const result=view.state.field(findField);
+  if(!result.matches.length)return;
+  view.dispatch({effects:moveFindEffect.of(direction)});
+  updateFindCount();scrollToActiveFindMatch();
+}
+function closeFindBar(returnFocus=true) {
+  findBarOpen=false;findBar.hidden=true;findInput.value='';
+  if(view.state.field(findField).query)setFindQuery('',false);
+  if(returnFocus)view.focus();
+}
+function openFindBar(query) {
+  if(typeof query!=='string'||!query) {
+    const selection=view.state.selection.main;
+    query=selection.empty?lastFindQuery:view.state.sliceDoc(selection.from,selection.to);
+  }
+  findBarOpen=true;findBar.hidden=false;hideToolbar(true);
+  findInput.value=query||'';setFindQuery(findInput.value);
+  findInput.focus();findInput.select();
+}
+findInput.addEventListener('input',()=>setFindQuery(findInput.value));
+findInput.addEventListener('keydown',event=>{
+  if(event.key==='Enter'){event.preventDefault();moveFind(event.shiftKey?-1:1);}
+  else if(event.key==='ArrowDown'){event.preventDefault();moveFind(1);}
+  else if(event.key==='ArrowUp'){event.preventDefault();moveFind(-1);}
+  else if(event.key==='Escape'){event.preventDefault();closeFindBar(true);}
+});
+for(const button of [findPrevious,findNext,findClose])button.addEventListener('mousedown',event=>event.preventDefault());
+findPrevious.addEventListener('click',()=>moveFind(-1));findNext.addEventListener('click',()=>moveFind(1));findClose.addEventListener('click',()=>closeFindBar(true));
 // The caret overlay only adds a soft visual trail; CodeMirror remains the
 // authority for selection, input, and the native caret.
 const motionPreference=window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -202,12 +303,16 @@ const foldField = StateField.define({
   }
 });
 function selectionLines(state) {
-  if(!state.field(focusField))return {key:'',ranges:[]};
-  const ranges=state.selection.ranges.map(range=>{
+  const ranges=state.field(focusField)?state.selection.ranges.map(range=>{
     const first=state.doc.lineAt(range.from),last=state.doc.lineAt(range.to);
     return {first:first.number,last:last.number,from:first.from,to:last.to};
-  });
-  return {key:ranges.map(range=>`${range.first}:${range.last}`).join(','),ranges};
+  }):[];
+  const result=state.field(findField),match=result.matches[result.activeIndex];
+  if(match) {
+    const first=state.doc.lineAt(match.from),last=state.doc.lineAt(match.to);
+    ranges.push({first:first.number,last:last.number,from:first.from,to:last.to,findFrom:match.from,findTo:match.to});
+  }
+  return {key:ranges.map(range=>`${range.first}:${range.last}:${range.findFrom??''}:${range.findTo??''}`).join(','),ranges};
 }
 const intersectsSelectionLines = (activeLines, from, to) => activeLines.ranges.some(range=>from<=range.to&&to>=range.from);
 function editSource(view, pos) {
@@ -722,7 +827,7 @@ function decorationState(state,active=selectionLines(state)) {
 const decorationField=StateField.define({
   create:state=>decorationState(state),
   update(value,transaction) {
-    const state=transaction.state,effectsChanged=transaction.effects.some(effect=>effect.is(foldEffect)||effect.is(focusEffect)||effect.is(linkMetadataEffect)||effect.is(setAIPendingEffect)||effect.is(clearAIPendingEffect));
+    const state=transaction.state,effectsChanged=transaction.effects.some(effect=>effect.is(foldEffect)||effect.is(focusEffect)||effect.is(linkMetadataEffect)||effect.is(setFindQueryEffect)||effect.is(moveFindEffect)||effect.is(setAIPendingEffect)||effect.is(clearAIPendingEffect));
     if(transaction.docChanged||effectsChanged||syntaxTree(state)!==value.tree)return decorationState(state);
     if(transaction.selection) {
       const active=selectionLines(state);
@@ -874,6 +979,7 @@ function hideToolbar(immediate=false) {
 }
 function scheduleToolbar() {if(!toolbarFrame)toolbarFrame=requestAnimationFrame(()=>{toolbarFrame=0;updateToolbar();});}
 function updateToolbar() {
+  if(findBarOpen){hideToolbar(true);return;}
   const selection=selectedSnapshot();
   if(aiBusy){hideToolbar(true);return;}
   if(!selection || suppressedSelection===`${selection.id}:${selection.from}:${selection.to}` || (!view.hasFocus&&!toolbar.contains(document.activeElement))) {hideToolbar();return;}
@@ -907,13 +1013,13 @@ function localizedExtensions() {
 }
 function createState(doc) {
   return EditorState.create({doc,extensions:[
-    history(),drawSelection(),caretMotionPlugin,markdown({extensions:[GFM]}),focusField,typingRevealField,foldField,aiPendingField,linkMetadataField,decorationField,typingRevealTimerPlugin,aiPendingViewPlugin,
+    history(),drawSelection(),caretMotionPlugin,markdown({extensions:[GFM]}),focusField,typingRevealField,foldField,aiPendingField,linkMetadataField,findField,decorationField,typingRevealTimerPlugin,aiPendingViewPlugin,
     EditorView.lineWrapping,localizedExtension.of(localizedExtensions()),
     autocompletion({override:[wikiCompletionSource],maxRenderedOptions:12,interactionDelay:0}),
     keymap.of([
       {key:'Enter',run:()=>{const target=document.activeElement?.closest?.('[data-still-link-kind]');return target?activateRenderedLink(target):false;}},
       {key:'Mod-Enter',run:()=>activateAtPosition(view.state.selection.main.head)},
-      {key:'Mod-b',run:()=>{caretMotion?.snap();post({type:'toggleSidebar'});return true;}},{key:'Mod-i',run:()=>applyFormat('italic')},{key:'Mod-k',run:()=>applyFormat('link')},
+      {key:'Mod-b',run:()=>{caretMotion?.snap();post({type:'toggleSidebar'});return true;}},{key:'Mod-i',run:()=>applyFormat('italic')},{key:'Mod-Shift-k',run:()=>applyFormat('link')},{key:'Mod-k',run:()=>{post({type:'quickOpen'});return true;}},
       {key:'Escape',run:()=>{const current=selectedSnapshot();suppressedSelection=current?`${current.id}:${current.from}:${current.to}`:null;hideToolbar();return true;}},
       {key:'Tab',run:()=>acceptCompletion(view)},
       ...historyKeymap,...markdownKeymap,...defaultKeymap,indentWithTab
@@ -925,6 +1031,7 @@ function createState(doc) {
           if(to<from)pendingImages.delete(key);else pendingImages.set(key,{...pending,from,to});
         }
         post({type:'change',id:documentId,markdown:update.state.doc.toString()});
+        if(findBarOpen)updateFindCount();
       }
       if(update.selectionSet) suppressedSelection=null;
       if(update.docChanged||update.selectionSet||update.viewportChanged||update.focusChanged||update.geometryChanged)scheduleToolbar();
@@ -991,13 +1098,14 @@ window.stillEditor={
     const sameSource=sameDocument&&source===view.state.doc.toString();
     const localizationChanged=Object.keys(strings).length!==Object.keys(localized).length||Object.keys(strings).some(key=>strings[key]!==localized[key]);
     const availabilityChanged=aiAvailable!==available||wikiAvailable!==wiki;
-    strings=localized;aiAvailable=available;wikiAvailable=wiki;
+    strings=localized;aiAvailable=available;wikiAvailable=wiki;localizeFindBar();
     this.setAppearance({theme,reduceMotion});
     if(sameSource) {
       const effects=[];
       if(localizationChanged)effects.push(localizedExtension.reconfigure(localizedExtensions()));
       if(localizationChanged||availabilityChanged)effects.push(linkMetadataEffect.of(activeLinkMetadata));
       if(effects.length)view.dispatch({effects});
+      if(localizationChanged){localizeFindBar();updateFindCount();}
       if(localizationChanged||availabilityChanged){makeToolbar();scheduleToolbar();}
       return;
     }
@@ -1007,11 +1115,14 @@ window.stillEditor={
       activeLinkMetadata=pendingLinkMetadata?.id===id?pendingLinkMetadata:{id,documents:[]};
       pendingLinkMetadata=null;
     }
+    if(!sameDocument){closeFindBar(false);lastFindQuery='';}
     documentId=id;stableSelection=null;suppressedSelection=null;pendingImages.clear();caretMotion?.snap();hideToolbar(true);
     if(!sameDocument){aiBusy=false;aiLabel=null;}
     let state=createState(source);
     if(sameDocument)state=state.update({selection:{anchor:Math.min(oldSelection.anchor,source.length),head:Math.min(oldSelection.head,source.length)}}).state;
     view.setState(state);
+    if(sameDocument&&findBarOpen){findInput.value=lastFindQuery;setFindQuery(lastFindQuery);}
+    else updateFindCount();
     if(view.hasFocus)view.dispatch({effects:focusEffect.of(true)});
     post({type:'focus',id:documentId,focused:view.hasFocus});
     if(!sameDocument)view.scrollDOM.scrollTop=0;
@@ -1025,6 +1136,10 @@ window.stillEditor={
     activeLinkMetadata=snapshot;
     view.dispatch({effects:linkMetadataEffect.of(snapshot)});
     scheduleWikiCompletion();
+  },
+  showFind({id,query=null}={}) {
+    if(id!==documentId)return false;
+    openFindBar(query);return true;
   },
   setAIState({busy=false,label}) {
     const nextLabel=busy?(label??null):null;

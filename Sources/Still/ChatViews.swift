@@ -12,6 +12,9 @@ struct ChatView: View {
     let onOpenExternalLink: (URL) -> Void
 
     private var conversation: ChatConversation? { chat.activeConversation }
+    private var contextAnchorNote: Note? {
+        appModel.currentNoteID.flatMap { id in appModel.store.visibleNotes.first(where: { $0.id == id }) }
+    }
     private var settings: AISettings { appModel.store.settings }
     private var selectedModel: String { settings.model.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var isAIConfigured: Bool {
@@ -108,7 +111,7 @@ struct ChatView: View {
             VStack(spacing: 0) {
                 ZStack(alignment: .topLeading) {
                     ChatComposerTextView(text: $chat.draft, contextID: conversation?.id, isEditable: isAIConfigured) {
-                        if chat.canSend { chat.send() }
+                        if chat.canSend { sendMessage() }
                     }
                     if chat.draft.isEmpty {
                         Text(L10n.text("chat.placeholder"))
@@ -121,6 +124,46 @@ struct ChatView: View {
                 }
                 .frame(height: 100)
                 .accessibilityIdentifier("chat-composer")
+
+                HStack(spacing: 12) {
+                    Picker(L10n.text("chat.context.title"), selection: $chat.localContextScope) {
+                        ForEach(ChatLocalContextScope.allCases) { scope in
+                            Text(L10n.text(scope.localizationKey))
+                                .tag(scope)
+                                .disabled((scope == .currentNote || scope == .currentFolder) && contextAnchorNote == nil)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .controlSize(.small)
+                    .accessibilityLabel(L10n.text("chat.context.title"))
+                    .accessibilityIdentifier("chat-local-context")
+
+                    Toggle(L10n.text("chat.context.confluence"), isOn: $chat.includeConfluenceInContext)
+                        .toggleStyle(.checkbox)
+                        .font(.system(size: 10))
+                        .disabled(!appModel.store.confluenceSettings.enabled)
+                        .help(L10n.text(appModel.store.confluenceSettings.enabled
+                                        ? "chat.context.confluenceHelp"
+                                        : "chat.context.confluenceUnavailable"))
+                        .accessibilityIdentifier("chat-confluence-context")
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 9)
+
+                if chat.localContextScope == .currentNote || chat.localContextScope == .currentFolder {
+                    Text(chatContextDescription)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .padding(.horizontal, 10)
+                }
+
+                Text(L10n.text("chat.context.historyNote"))
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10)
 
                 HStack(spacing: 8) {
                     Text(selectedModel.isEmpty
@@ -174,7 +217,7 @@ struct ChatView: View {
                             .accessibilityIdentifier("chat-stop")
                             .transition(CalmMotion.reveal(reduceMotion: reduceMotion))
                         } else {
-                            Button(action: chat.send) {
+                            Button(action: sendMessage) {
                                 Label(L10n.text("chat.send"), systemImage: "arrow.up")
                                     .labelStyle(.titleAndIcon)
                                     .font(.system(size: 11, weight: .medium))
@@ -199,6 +242,28 @@ struct ChatView: View {
         .frame(maxWidth: 760)
         .padding(.horizontal, 32)
         .frame(maxWidth: .infinity)
+    }
+
+    private func sendMessage() {
+        chat.send(context: ChatRequestContext(
+            localScope: chat.localContextScope,
+            anchorNoteID: appModel.currentNoteID,
+            includeConfluence: chat.includeConfluenceInContext
+        ))
+    }
+
+    private var chatContextDescription: String {
+        guard let note = contextAnchorNote else { return L10n.text("chat.context.noCurrentNote") }
+        let location = ([L10n.text(note.section == .wiki ? "nav.wiki" : "nav.notes")] + note.folders).joined(separator: " / ")
+        if chat.localContextScope == .currentNote {
+            return String(format: L10n.text("chat.context.anchorNote"), note.title, location)
+        }
+        let noteCount = ChatContextPolicy.allowedLocalNoteIDs(
+            for: ChatRequestContext(localScope: .currentFolder,
+                                    anchorNoteID: note.id,
+                                    includeConfluence: false),
+            visibleNotes: appModel.store.visibleNotes).count
+        return String(format: L10n.text("chat.context.anchorFolder"), location, noteCount)
     }
 }
 
