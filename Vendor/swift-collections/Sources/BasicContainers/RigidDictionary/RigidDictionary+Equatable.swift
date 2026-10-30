@@ -1,0 +1,69 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if !COLLECTIONS_SINGLE_MODULE
+import InternalCollectionsUtilities
+#endif
+
+
+#if compiler(>=6.4) && UnstableHashedContainers
+
+@available(SwiftStdlib 5.0, *)
+extension RigidDictionary where Key: ~Copyable, Value: ~Copyable {
+  @inlinable
+  public func isTriviallyIdentical(to other: borrowing Self) -> Bool {
+    unsafe self._keys.isTriviallyIdentical(to: other._keys)
+    && self._values == other._values
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension RigidDictionary where Key: ~Copyable, Value: ~Copyable {
+  @inlinable
+  public func isEqual(
+    to other: borrowing Self,
+    by areEquivalent: (borrowing Value, borrowing Value) -> Bool
+  ) -> Bool {
+    if self.isTriviallyIdentical(to: other) { return true }
+    
+    guard self.count == other.count else { return false }
+    
+    var it = unsafe self._keys._table.makeBucketIterator()
+    while let next = it.nextOccupiedRegion() {
+      var lb = next.lowerBound
+      while lb < next.upperBound {
+        let res = unsafe other._find(self._keyPtr(at: lb).pointee)
+        guard let rb = res.bucket else { return false }
+        
+        let lp = unsafe self._valuePtr(at: lb)
+        let rp = unsafe other._valuePtr(at: rb)
+        guard unsafe areEquivalent(lp.pointee, rp.pointee) else { return false }
+        lb._offset &+= 1
+      }
+    }
+    return true
+  }
+}
+
+@available(SwiftStdlib 6.4, *)
+extension RigidDictionary: Equatable where Key: ~Copyable, Value: Equatable & ~Copyable {}
+
+@available(SwiftStdlib 5.0, *)
+extension RigidDictionary where Key: ~Copyable, Value: Equatable & ~Copyable {
+  @inlinable
+  public static func ==(left: borrowing Self, right: borrowing Self) -> Bool {
+    left.isEqual(to: right, by: ==)
+  }
+}
+
+#endif

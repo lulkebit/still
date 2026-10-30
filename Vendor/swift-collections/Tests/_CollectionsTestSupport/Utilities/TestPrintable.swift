@@ -1,0 +1,142 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2025 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if COLLECTIONS_SINGLE_MODULE
+import Collections
+#else
+import ContainersPreview
+import SpanPreview
+#endif
+
+/// A silly variant of `CustomDebugStringConvertible` that supports noncopyable
+/// and nonescapable conforming types.
+///
+/// This is expected to be replaced by the stdlib's solution, once we have one.
+/// (It can be as simple as generalizing the standard protocol, but for it serve
+/// its purpose, we also need to be able to perform runtime conformance checks
+/// on noncopyable/nonescapable entities (or otherwise detect and invoke this
+/// property. Additionally, materializing a full `String` instance up front can
+/// be too expensive in some environments -- we also need a solution that
+/// streams descriptions into some caller-provided buffer, eliminating
+/// memory overhead.)
+public protocol TestPrintable: ~Copyable, ~Escapable {
+  var testDescription: String { get }
+}
+
+extension TestPrintable where Self: CustomStringConvertible {
+  @inlinable
+  public var testDescription: String { description }
+}
+extension TestPrintable where Self: CustomDebugStringConvertible {
+  @inlinable
+  public var testDescription: String { debugDescription }
+}
+extension TestPrintable where Self: CustomStringConvertible & CustomDebugStringConvertible {
+  @inlinable
+  public var testDescription: String { description }
+}
+
+extension Int: TestPrintable {}
+extension UInt: TestPrintable {}
+extension String: TestPrintable {}
+extension Bool: TestPrintable {}
+
+extension _Pointer {
+  internal var _description: String {
+    let hex = String(UInt(bitPattern: self), radix: 16)
+    let len = MemoryLayout<Self>.size * 2
+    return "0x" + String(repeating: "0", count: len - hex.count) + hex
+  }
+}
+
+internal func _bufferDescription<P: _Pointer>(
+  _ typename: String, start: P?, count: Int
+) -> String {
+  "\(typename)(start: \(start?._description ?? "nil"), count: \(count))"
+}
+
+extension UnsafeRawBufferPointer: TestPrintable {
+  public var testDescription: String {
+    unsafe _bufferDescription(
+      "UnsafeRawBufferPointer", start: baseAddress, count: count)
+  }
+}
+extension UnsafeMutableRawBufferPointer: TestPrintable {
+  public var testDescription: String {
+    unsafe _bufferDescription(
+      "UnsafeMutableRawBufferPointer", start: baseAddress, count: count)
+  }
+}
+extension UnsafeBufferPointer: TestPrintable
+where Element: ~Copyable
+{
+  public var testDescription: String {
+    unsafe _bufferDescription("UnsafeBufferPointer", start: baseAddress, count: count)
+  }
+}
+extension UnsafeMutableBufferPointer: TestPrintable
+where Element: ~Copyable
+{
+  public var testDescription: String {
+    unsafe _bufferDescription(
+      "UnsafeMutableBufferPointer", start: baseAddress, count: count)
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension Span: TestPrintable where Element: ~Copyable {
+  public var testDescription: String {
+    self.withUnsafeBufferPointer { buffer in
+      unsafe _bufferDescription("Span", start: buffer.baseAddress, count: buffer.count)
+    }
+  }
+}
+@available(SwiftStdlib 5.0, *)
+extension MutableSpan: TestPrintable where Element: ~Copyable  {
+  public var testDescription: String {
+    self.withUnsafeBufferPointer { buffer in
+      unsafe _bufferDescription("MutableSpan", start: buffer.baseAddress, count: buffer.count)
+    }
+  }
+}
+@available(SwiftStdlib 5.0, *)
+extension OutputSpan: TestPrintable where Element: ~Copyable  {
+  public var testDescription: String {
+    let capacity = self.capacity
+    return self.span.withUnsafeBufferPointer { buffer in
+      """
+      OutputSpan(\
+      start: \(unsafe buffer.baseAddress?._description ?? "nil"), \
+      capacity: \(capacity), \
+      count: \(buffer.count))
+      """
+    }
+  }
+}
+
+#if UnstableContainersPreview
+@available(SwiftStdlib 5.0, *)
+extension InputSpan: TestPrintable where Element: ~Copyable  {
+  public var testDescription: String {
+    let capacity = self.capacity
+    return self.span.withUnsafeBufferPointer { buffer in
+      """
+      InputSpan(\
+      start: \(unsafe buffer.baseAddress?._description ?? "nil"), \
+      capacity: \(capacity), \
+      count: \(buffer.count))
+      """
+    }
+  }
+}
+#endif

@@ -1,0 +1,141 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if compiler(>=6.4) && UnstableHashedContainers
+
+@available(SwiftStdlib 5.0, *)
+extension UniqueSet where Element: ~Copyable {
+  @inlinable
+  package mutating func _insert(
+    _ item: consuming Element
+  ) -> RigidSet<Element>._InsertResult {
+    let r = _storage._find(item)
+    if let bucket = r.bucket {
+      return .init(bucket: bucket, remnant: item)
+    }
+    var hashValue = r.hashValue
+    if _ensureFreeCapacity(1), !_isSmall {
+      hashValue = _storage._hashValue(for: item)
+    }
+    let bucket = _storage._insertNew(item, hashValue: hashValue)
+    return .init(bucket: bucket, remnant: nil)
+  }
+  
+  /// Inserts the given element into the set unconditionally. If the set already
+  /// contained a member equal to `item`, then the new item replaces it.
+  ///
+  /// - Parameter item: An element to insert into the set.
+  /// - Returns: An element equal to `item` if the set already contained such
+  ///    a member, otherwise `nil`.
+  @inlinable
+  @discardableResult
+  public mutating func update(
+    with item: consuming Element
+  ) -> Element? {
+    var r = self._insert(item)
+    guard let remnant = r.remnant.take() else { return nil }
+    return unsafe exchange(
+      &_storage._memberPtr(at: r.bucket).pointee,
+      with: remnant)
+  }
+
+  /// Inserts the given element in the set if it is not already present.
+  ///
+  /// - Parameter item: An element to insert into the set.
+  /// - Returns: `item` if an equal member already exists in the set;
+  ///     otherwise `nil`.
+  @inlinable
+  @discardableResult
+  public mutating func insert(
+    _ item: consuming Element
+  ) -> Element? {
+    var r = self._insert(item)
+    return r.remnant.take()
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension UniqueSet where Element: ~Copyable {
+  @_alwaysEmitIntoClient
+  public mutating func insert<E: Error>(
+    addingCount newItemCount: Int,
+    initializingWith initializer: (inout OutputSpan<Element>) throws(E) -> Void
+  ) throws(E) -> Void {
+    _ensureFreeCapacity(newItemCount)
+    try _storage.insert(
+      addingCount: newItemCount, initializingWith: initializer)
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension UniqueSet /* where Element: Copyable */ {
+  @_alwaysEmitIntoClient
+  public mutating func insert(
+    copying items: borrowing Span<Element>
+  ) {
+    _ensureFreeCapacity(items.count)
+    _storage.insert(copying: items)
+  }
+  
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  package mutating func _insert<
+    S: Iterable & ~Copyable & ~Escapable
+  >(
+    copying items: borrowing S
+  ) throws(S.Failure)
+  where S.Element == Element {
+    _ensureFreeCapacity(items.underestimatedCount)
+    var it = items.makeBorrowingIterator()
+    while true {
+      let span = try it.nextSpan()
+      guard !span.isEmpty else { break }
+      self.insert(copying: span)
+    }
+  }
+
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public mutating func insert<
+    S: Iterable & ~Copyable & ~Escapable
+  >(
+    copying items: borrowing S
+  ) throws(S.Failure) where S.Element == Element {
+    try _insert(copying: items)
+  }
+
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public mutating func insert(copying items: some Sequence<Element>) {
+    _ensureFreeCapacity(items.underestimatedCount)
+    var it = items.makeIterator()
+    while let next = it.next() {
+      self.insert(next)
+    }
+  }
+  
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public mutating func insert<
+    S: Iterable & Sequence<Element>
+  >(
+    copying items: borrowing S
+  ) throws(S.Failure)
+  where S.Element == Element {
+    try _insert(copying: items)
+  }
+}
+
+#endif

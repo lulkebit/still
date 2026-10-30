@@ -1,0 +1,155 @@
+name: Pull request
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+jobs:
+  tests:
+    name: Test
+    uses: swiftlang/github-workflows/.github/workflows/swift_package_test.yml@0.0.16
+    with:
+      enable_macos_checks: true
+      macos_exclude_xcode_versions: '[{"xcode_version": "swift_6.1"}]'
+      linux_exclude_swift_versions: '[{"swift_version": "5.9"}, {"swift_version": "5.10"}, {"swift_version": 6.0}, {"swift_version": 6.1}]'
+      windows_exclude_swift_versions: '[{"swift_version": "5.9"}, {"swift_version": 6.0}, {"swift_version": 6.1}]'
+      enable_wasm_sdk_build: true
+      enable_android_sdk_build: true
+      enable_android_sdk_checks: true
+      enable_freebsd_checks: true
+
+  containers-tests:
+    name: Containers Test
+    uses: swiftlang/github-workflows/.github/workflows/swift_package_test.yml@0.0.16
+    with:
+      linux_swift_versions: '["6.2", "nightly-main"]'
+      enable_macos_checks: false
+      enable_linux_checks: true
+      enable_windows_checks: false
+      swift_flags: --traits UnstableContainersPreview
+
+  hashed-containers-tests:
+    name: Hashed Containers Test
+    uses: swiftlang/github-workflows/.github/workflows/swift_package_test.yml@0.0.16
+    with:
+      linux_swift_versions: '["6.2", "nightly-main"]'
+      enable_macos_checks: false
+      enable_linux_checks: true
+      enable_windows_checks: false
+      swift_flags: --traits UnstableHashedContainers
+
+  all-traits-tests:
+    name: All Unstable Package Traits Test
+    uses: swiftlang/github-workflows/.github/workflows/swift_package_test.yml@0.0.16
+    with:
+      linux_swift_versions: '["6.2", "6.3", "nightly-6.4.x", "nightly-main"]'
+      enable_macos_checks: false
+      enable_linux_checks: true
+      enable_windows_checks: false
+      swift_flags: --traits UnstableHashedContainers,UnstableContainersPreview,UnstableSortedCollections
+
+  embedded-swift:
+    name: Build with Embedded Swift
+    uses: swiftlang/github-workflows/.github/workflows/swift_package_test.yml@0.0.16
+    with:
+      enable_linux_checks: false
+      enable_macos_checks: false
+      enable_windows_checks: false
+      enable_wasm_sdk_build: false
+      enable_embedded_wasm_sdk_build: true
+      swift_flags: --target Collections
+
+  soundness:
+    name: Soundness
+    uses: swiftlang/github-workflows/.github/workflows/soundness.yml@0.0.16
+    with:
+      license_header_check_project_name: "Swift.org"
+      # https://github.com/apple/swift-collections/issues/428
+      python_lint_check_enabled: false
+      # https://github.com/apple/swift-collections/issues/429
+      docs_check_enabled: false
+      # https://github.com/apple/swift-collections/issues/430
+      shell_check_enabled: false
+      # https://github.com/apple/swift-collections/issues/431
+      format_check_enabled: false
+      # https://github.com/apple/swift-collections/issues/435
+      api_breakage_check_enabled: false
+
+  cmake-build:
+    name: CMake Build
+    runs-on: ubuntu-latest
+    container:
+      image: swiftlang/swift:nightly-main-jammy
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Install apt dependencies
+        run: apt-get -qq update && apt-get -qq -y install curl ninja-build
+      - name: Install CMake
+        id: install-cmake
+        uses: swiftlang/github-workflows/.github/actions/install-cmake@0.0.16
+        with:
+          cmake-version: "3.30.2"
+          hash: "cdd7fb352605cee3ae53b0e18b5929b642900e33d6b0173e19f6d4f2067ebf16"
+      - name: CMake version
+        shell: bash
+        env:
+          CMAKE: ${{ steps.install-cmake.outputs.cmake }}
+        run: |
+          "$CMAKE" --version
+      - name: Configure with CMake
+        shell: bash
+        env:
+          CMAKE: ${{ steps.install-cmake.outputs.cmake }}
+        run: |
+          "$CMAKE" -G Ninja -S . -B .cmake-build
+      - name: Build with CMake
+        shell: bash
+        env:
+          CMAKE: ${{ steps.install-cmake.outputs.cmake }}
+        run: |
+          "$CMAKE" --build .cmake-build
+      - name: Configure with CMake (Single-module mode)
+        shell: bash
+        env:
+          CMAKE: ${{ steps.install-cmake.outputs.cmake }}
+        run: |
+          "$CMAKE" -G Ninja -S . -B .singlemodule-build -D COLLECTIONS_SINGLE_MODULE=ON
+      - name: Build with CMake (Single-module mode)
+        shell: bash
+        env:
+          CMAKE: ${{ steps.install-cmake.outputs.cmake }}
+        run: |
+          "$CMAKE" --build .singlemodule-build
+      - name: Configure with CMake (Foundation toolchain module mode)
+        shell: bash
+        env:
+          CMAKE: ${{ steps.install-cmake.outputs.cmake }}
+        run: |
+          "$CMAKE" -G Ninja -S . -B .foundation-build -D COLLECTIONS_FOUNDATION_TOOLCHAIN_MODULE=ON
+      - name: Build with CMake (Foundation toolchain module mode)
+        shell: bash
+        env:
+          CMAKE: ${{ steps.install-cmake.outputs.cmake }}
+        run: |
+          "$CMAKE" --build .foundation-build
+
+  xcode-build:
+    name: Xcode Project Build
+    runs-on: [self-hosted, macos, "tahoe", "ARM64"]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v7
+      - name: Select Xcode
+        run: echo "DEVELOPER_DIR=/Applications/Xcode_swift_6.4.app/Contents/Developer" >> $GITHUB_ENV
+      - name: Xcode version
+        run: xcrun xcodebuild -version
+      - name: Swift version
+        run: xcrun swift --version
+      - name: Build Collections
+        run: xcrun xcodebuild -project Xcode/Collections.xcodeproj -scheme Collections
+      - name: Build ContainersPreview
+        run: xcrun xcodebuild -project Xcode/Collections.xcodeproj -scheme ContainersPreview

@@ -20,13 +20,29 @@ These screenshots use fictional demo content about a small reading salon.
 
 ## Build
 
-Requires macOS 27 or later, Xcode 27 with Swift 6.4, and Node.js/npm only when the bundled editor needs rebuilding.
+Requires macOS 27 or later and Xcode 27 with Swift 6.4. The normal app build works offline and needs no Node.js, npm, Homebrew, or access to GitHub.
 
 ```sh
 ./Scripts/build.sh
 ```
 
-The script creates `build/still.app`. It reuses the bundled editor when its source files are unchanged and prints the app path when packaging finishes. To build and run the Swift tests directly, use `swift test`.
+The script creates `build/still.app` and prints the app path when packaging finishes. All Swift dependencies, including their transitive dependencies, are included as local source packages in `Vendor/`. Keep that directory when copying or archiving the project; an existing `.build/` directory or package cache is not required. Versions, upstream revisions, licenses, and maintenance instructions are documented in [`Vendor/README.md`](Vendor/README.md).
+
+The editor is already bundled in the repository. The build validates its contents against the editor sources, independently of file timestamps, and never installs npm packages. If the bundle is missing or out of date, the build stops with instructions to rebuild it explicitly.
+
+To build and run the Swift tests directly, use `swift test`.
+
+### Editor development
+
+Only changes to the JavaScript editor require Node.js/npm. On a development machine with access to the npm registry, regenerate and commit the editor bundle and its content fingerprint together with the sources:
+
+```sh
+cd Editor
+npm ci
+npm run build
+```
+
+Afterward, the normal app build works offline again. Optional AI and Confluence connections still need access to their configured endpoints when used.
 
 ## Optional AI
 

@@ -1,0 +1,186 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2025 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if !COLLECTIONS_SINGLE_MODULE
+import InternalCollectionsUtilities
+#endif
+
+@available(SwiftStdlib 5.0, *)
+extension RigidDeque where Element: ~Copyable {
+  /// Initializes a new rigid deque with zero capacity and no elements.
+  ///
+  /// - Complexity: O(1)
+  @inlinable
+  public init() {
+    unsafe self.init(_handle: .allocate(capacity: 0))
+  }
+
+  /// Creates an empty rigid deque with the specified capacity.
+  @_alwaysEmitIntoClient
+  public init(capacity: Int) {
+    unsafe self.init(_handle: .allocate(capacity: capacity))
+  }
+
+  /// Creates a rigid deque with the specified capacity, then calls the given
+  /// closure with an output span covering the deque's uninitialized memory.
+  ///
+  /// - Parameters:
+  ///   - capacity: The number of elements to allocate space for in the new
+  ///     rigid deque.
+  ///   - initializer: A closure that initializes the elements of the new deque.
+  ///     - Parameter initializer: An `OutputSpan` allowing initialization of the
+  ///       deque's initial elements.
+  @inlinable @inline(__always)
+  public init<E: Error>(
+    capacity: Int,
+    initializingWith initializer: (inout OutputSpan<Element>) throws(E) -> Void
+  ) throws(E) {
+    unsafe self.init(_handle: .allocate(capacity: capacity))
+    try self.append(addingCount: capacity, initializingWith: initializer)
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension RigidDeque where Element: ~Copyable {
+  /// Creates a new rigid deque taking over the storage of the specified
+  /// unique deque instance, consuming it in the process.
+  ///
+  /// - Complexity: O(1)
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public init(consuming deque: consuming UniqueDeque<Element>) {
+    self = deque._storage
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension RigidDeque /*where Element: Copyable*/ {
+  /// Creates a new deque containing the specified number of a single,
+  /// repeated value.
+  ///
+  /// - Parameters:
+  ///   - repeatedValue: The element to repeat.
+  ///   - count: The number of times to repeat the value passed in the
+  ///     `repeating` parameter. `count` must be zero or greater.
+  ///
+  /// - Complexity: O(`count`)
+  @inlinable
+  public init(repeating repeatedValue: Element, count: Int) {
+    self.init(capacity: count)
+    unsafe _handle.mutableBuffer.initialize(repeating: repeatedValue)
+    unsafe _handle._count = count
+  }
+}
+
+
+@available(SwiftStdlib 5.0, *)
+extension RigidDeque /*where Element: Copyable*/ {
+#if compiler(>=6.4)
+  /// Creates a new deque with the specified capacity, holding a copy
+  /// of the contents of a given borrowing sequence.
+  ///
+  /// - Parameters:
+  ///   - capacity: The storage capacity of the new deque.
+  ///   - contents: A sequence whose contents to copy into the new deque.
+  ///      The sequence must not contain more than `capacity` elements.
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public init<S: Iterable & ~Copyable & ~Escapable>(
+    capacity: Int,
+    copying contents: borrowing S
+  ) throws(S.Failure)
+  where S.Element == Element {
+    self.init(capacity: capacity)
+    try self._append(copying: contents)
+  }
+#endif
+
+  /// Creates a new deque with the specified capacity, holding a copy
+  /// of the contents of a given sequence.
+  ///
+  /// - Parameters:
+  ///   - capacity: The storage capacity of the new deque.
+  ///   - contents: The sequence whose contents to copy into the new deque.
+  ///      The sequence must not contain more than `capacity` elements.
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public init(
+    capacity: Int,
+    copying contents: some Sequence<Element>
+  ) {
+    self.init(capacity: capacity)
+    self.append(copying: contents)
+  }
+
+  /// Creates a new rigid deque from the given collection, with the capacity
+  /// derived from the collection's count.
+  ///
+  /// - Parameters:
+  ///   - capacity: The desired capacity of the new deque, or nil to allocate
+  ///      just enough storage to fit the contents.
+  ///   - contents: The collection whose contents to copy into the new deque.
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public init(
+    capacity: Int? = nil,
+    copying contents: some Collection<Element>
+  ) {
+    self.init(capacity: capacity ?? contents.count)
+    self.append(copying: contents)
+  }
+
+#if compiler(>=6.4)
+  /// Creates a new deque with the specified capacity, holding a copy
+  /// of the contents of a given sequence.
+  ///
+  /// - Parameters:
+  ///   - capacity: The storage capacity of the new deque.
+  ///   - contents: A sequence whose contents to copy into the new deque.
+  ///      The sequence must not contain more than `capacity` elements.
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public init<S: Iterable & Sequence<Element>>(
+    capacity: Int,
+    copying contents: borrowing S
+  ) throws(S.Failure)
+  where S.Element == Element {
+    self.init(capacity: capacity)
+    try self._append(copying: contents)
+  }
+#endif
+
+#if compiler(>=6.4)
+  /// Creates a new deque with the specified capacity, holding a copy
+  /// of the contents of a given collection.
+  ///
+  /// - Parameters:
+  ///   - capacity: The storage capacity of the new deque, or nil to copy all
+  ///      items. If specified, the capacity must be greater
+  ///      than or equal to the count of the collection.
+  ///   - contents: A collection whose contents to copy into the new deque.
+  ///      The sequence must not contain more than `capacity` elements.
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  public init<S: Iterable & Collection<Element>>(
+    capacity: Int? = nil,
+    copying contents: S
+  ) throws(S.Failure)
+  where S.Element == Element {
+    self.init(capacity: capacity ?? contents.count)
+    try self._append(copying: contents)
+  }
+#endif
+}

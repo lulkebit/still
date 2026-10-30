@@ -1,0 +1,415 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2025 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if !COLLECTIONS_SINGLE_MODULE
+import InternalCollectionsUtilities
+import SpanPreview
+#endif
+
+@available(SwiftStdlib 5.0, *)
+extension UniqueDeque where Element: ~Copyable {
+  /// Adds an element to the front of the deque.
+  ///
+  /// If the deque does not have sufficient capacity to hold any more elements,
+  /// then this reallocates the deque's storage to grow its capacity, using a
+  /// geometric growth rate.
+  ///
+  /// - Parameter item: The element to prepend to the deque.
+  ///
+  /// - Complexity: O(1) when amortized over many invocations on the same deque.
+  @_alwaysEmitIntoClient
+  @_transparent
+  public mutating func prepend(_ item: consuming Element) {
+    _ensureFreeCapacity(1)
+    unsafe _storage._handle.uncheckedPrepend(item)
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension UniqueDeque where Element: ~Copyable {
+  /// Efficiently prepend a given number of items to the front of this deque by
+  /// populating a series of storage regions through repeated calls of the
+  /// specified callback function.
+  ///
+  /// If the deque doesn't have sufficient capacity to accommodate the specified
+  /// number of new elements, then this method reallocates the deque's storage
+  /// to grow it, using a geometric growth rate.
+  ///
+  ///     var buffer = UniqueDeque<Int>()
+  ///     buffer.append(999)
+  ///     var i = 0
+  ///     buffer.prepend(addingCount: 6) { target in
+  ///       while !target.isFull {
+  ///         target.append(i)
+  ///         i += 1
+  ///       }
+  ///     }
+  ///     // `buffer` now contains [0, 1, 2, 3, 4, 5, 999]
+  ///
+  /// The newly prepended items are not guaranteed to form a single contiguous
+  /// storage region. Therefore, the supplied callback may be invoked multiple
+  /// times to initialize each successive chunk of storage. However, invocations
+  /// cease if the callback fails to fully populate its output span or if
+  /// it throws an error. In such cases, the deque keeps all items that were
+  /// successfully initialized before the callback terminated the prepend.
+  ///
+  /// Note: Partial prepends create a gap in ring buffer storage that needs to
+  /// be closed by moving newly prepended items to their correct positions given
+  /// the adjusted count. This adds some overhead compared to adding exactly as
+  /// many items as promised.
+  ///
+  ///     var buffer = UniqueDeque<Int>()
+  ///     buffer.append(999)
+  ///     var i = 0
+  ///     buffer.prepend(addingCount: 6) { target in
+  ///       while !target.isFull, i <= 3 {
+  ///         target.append(i)
+  ///         i += 1
+  ///       }
+  ///     }
+  ///     // `buffer` now contains [0, 1, 2, 3, 999]
+  ///
+  /// - Parameters:
+  ///    - newItemCount: The maximum number of items to prepend to the deque.
+  ///    - body: A callback that gets called at most twice to directly
+  ///       populate newly reserved storage within the deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`newItemCount`) in addition to the complexity of the callback
+  ///    invocations, when amortized over many similar invocations on the same
+  ///    deque.
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func prepend<E: Error>(
+    addingCount newItemCount: Int,
+    initializingWith body: (inout OutputSpan<Element>) throws(E) -> Void
+  ) throws(E) -> Range<Int> {
+    guard newItemCount > 0 else { return 0 ..< 0 }
+    _ensureFreeCapacity(newItemCount)
+    return unsafe try _storage._handle.uncheckedPrepend(
+      addingCount: newItemCount, initializingWith: body)
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension UniqueDeque where Element: ~Copyable {
+  /// Moves the elements of a buffer to the front of this deque, leaving the
+  /// buffer uninitialized.
+  ///
+  /// If the deque doesn't have sufficient capacity to accommodate the new
+  /// elements, then this method reallocates the deque's storage to grow it,
+  /// using a geometric growth rate.
+  ///
+  /// - Parameters:
+  ///    - items: A fully initialized buffer whose contents to move into
+  ///        the deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`items.count`) when amortized over many similar
+  ///     invocations on the same deque.
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  @discardableResult
+  @unsafe
+  public mutating func prepend(
+    moving items: UnsafeMutableBufferPointer<Element>
+  ) -> Range<Int> {
+    _ensureFreeCapacity(items.count)
+    return unsafe _storage._handle.uncheckedPrepend(moving: items)
+  }
+
+#if UnstableContainersPreview
+  /// Moves the elements of an input span by prepending them to the front of
+  /// this deque, leaving the span empty.
+  ///
+  /// If the deque doesn't have sufficient capacity to accommodate the new
+  /// elements, then this method reallocates the deque's storage to grow it,
+  /// using a geometric growth rate.
+  ///
+  /// - Parameters:
+  ///    - items: An input span whose contents need to be prepended to this deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`items.count`) when amortized over many similar
+  ///     invocations on the same deque.
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func prepend(
+    moving items: inout InputSpan<Element>
+  ) -> Range<Int> {
+    unsafe items.withUnsafeMutableBufferPointer { buffer, count in
+      let source = unsafe buffer._extracting(last: count)
+      count = 0
+      return unsafe self.prepend(moving: source)
+    }
+  }
+#endif
+
+  /// Moves the elements of an output span by prepending them to the front of
+  /// this deque, leaving the span empty.
+  ///
+  /// If the deque doesn't have sufficient capacity to accommodate the new
+  /// elements, then this method reallocates the deque's storage to grow it,
+  /// using a geometric growth rate.
+  ///
+  /// - Parameters:
+  ///    - items: An output span whose contents need to be prepended to this deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`items.count`) when amortized over many similar
+  ///     invocations on the same deque.
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func prepend(
+    moving items: inout OutputSpan<Element>
+  ) -> Range<Int> {
+    unsafe items.withUnsafeMutableBufferPointer { buffer, count in
+      let source = unsafe buffer._extracting(first: count)
+      count = 0
+      return unsafe self.prepend(moving: source)
+    }
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension UniqueDeque /*where Element: Copyable*/ {
+  /// Copies the elements of a buffer and prepend them to the front of this
+  /// deque.
+  ///
+  /// If the deque doesn't have sufficient capacity to accommodate the specified
+  /// number of new elements, then this method reallocates the deque's storage
+  /// to grow it, using a geometric growth rate.
+  ///
+  /// - Parameters:
+  ///    - items: A fully initialized buffer whose contents to copy into
+  ///       the deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`items.count`) when amortized over many similar
+  ///     invocations on the same deque.
+  @_alwaysEmitIntoClient
+  @discardableResult
+  @unsafe
+  public mutating func prepend(
+    copying items: UnsafeBufferPointer<Element>
+  ) -> Range<Int> {
+    _ensureFreeCapacity(items.count)
+    return unsafe _storage._handle.uncheckedPrepend(copying: items)
+  }
+
+  /// Copies the elements of a buffer and prepend them to the front of this
+  /// deque.
+  ///
+  /// If the deque doesn't have sufficient capacity to accommodate the specified
+  /// number of new elements, then this method reallocates the deque's storage
+  /// to grow it, using a geometric growth rate.
+  ///
+  /// - Parameters:
+  ///    - items: A fully initialized buffer whose contents to copy into
+  ///        the deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`items.count`) when amortized over many similar
+  ///     invocations on the same deque.
+  @_alwaysEmitIntoClient
+  @unsafe
+  public mutating func prepend(
+    copying items: UnsafeMutableBufferPointer<Element>
+  ) -> Range<Int> {
+    unsafe self.prepend(copying: UnsafeBufferPointer(items))
+  }
+
+  /// Copy the elements of a span and prepend them to the front of this deque.
+  ///
+  /// If the deque does not have sufficient capacity to hold all items in the
+  /// span, then this triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - items: A span whose contents to copy into the deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`items.count`) when amortized over many similar
+  ///     invocations on the same deque.
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func prepend(copying items: Span<Element>) -> Range<Int> {
+    items.withUnsafeBufferPointer { source in
+      unsafe self.prepend(copying: source)
+    }
+  }
+
+#if compiler(>=6.4)
+  @available(SwiftStdlib 6.4, *)
+  @inlinable
+  internal mutating func _prepend<S: Iterable & ~Copyable & ~Escapable>(
+    copying items: borrowing S
+  ) throws(S.Failure)
+  where S.Element == Element
+  {
+    // We don't know the exact count of new elements, so we cannot initialize
+    // them in place. Append them to the end of the deque first, then rotate
+    // them to their correct location.
+    //
+    // FIXME: If we get a BorrowingSequence.estimatedCount with an exact case,
+    // then we should use that when possible to copy items to their final
+    // location in a single pass.
+    let oldCount = self.count
+    try self._append(copying: items) // Not a typo!
+    unsafe _storage._handle.rotate(toStartAtOffset: oldCount)
+  }
+
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  package mutating func _prepend<S: Iterable & ~Copyable & ~Escapable>(
+    copying items: borrowing S,
+    exactCount: Int
+  ) throws(S.Failure) -> Range<Int>
+  where S.Element == Element {
+    var it = items.makeBorrowingIterator()
+    return try self.prepend(addingCount: exactCount) { (target) throws(S.Failure) in
+      let span = try it.nextSpan(maxCount: target.freeCapacity)
+      target._append(copying: span)
+    }
+  }
+
+  /// Copies the elements of a borrowing sequence and prepend them to the front
+  /// of this deque.
+  ///
+  /// If the deque does not have sufficient capacity to hold all items in the
+  /// sequence, then this triggers a runtime error.
+  ///
+  /// As borrowing sequences do not necessarily provide an exact count, this
+  /// operation works by first appending the items, then finalizing the
+  /// prepend by rotating them in place as a postprocessing step.
+  ///
+  /// - Parameters:
+  ///    - items: The new elements to copy into the deque.
+  ///
+  /// - Complexity: O(*m*), where *m* is the length of `items`, as amortized
+  ///     over many similar invocations on the same deque.
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  public mutating func prepend<S: Iterable & ~Copyable & ~Escapable>(
+    copying items: borrowing S
+  ) throws(S.Failure)
+  where S.Element == Element {
+    try self._prepend(copying: items)
+  }
+#endif
+
+  /// Prepend the elements of a sequence to the front of this deque by copying
+  /// them.
+  ///
+  /// If the deque does not have sufficient capacity to accommodate the new
+  /// elements, then this method reallocates the deque's storage to grow it,
+  /// using a geometric growth rate.
+  ///
+  /// This example prepends the elements of a `Range<Int>` instance
+  /// to a unique deque of integers.
+  ///
+  ///     var numbers = UniqueDeque<Int>()
+  ///     numbers.append(copying: [1, 2, 3, 4, 5])
+  ///     numbers.prepend(copying: 10...15)
+  ///     // `numbers` now contains [10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5]
+  ///
+  /// As borrowing sequences do not necessarily provide an exact count, this
+  /// operation works by first appending the items, then finalizing the
+  /// prepend by rotating them in place as a postprocessing step.
+  ///
+  /// - Parameter items: The elements to prepend to the deque.
+  ///
+  /// - Complexity: O(`items.count`) when amortized over many similar
+  ///     invocations on the same deque.
+  @inlinable
+  @_alwaysEmitIntoClient
+  public mutating func prepend(
+    copying items: some Sequence<Element>
+  ) {
+    let done: Void? = items.withContiguousStorageIfAvailable { source in
+      unsafe self.prepend(copying: source)
+      return
+    }
+    guard done == nil else { return }
+    let oldCount = self.count
+    self.append(copying: items) // Not a typo!
+    unsafe _storage._handle.rotate(toStartAtOffset: oldCount)
+  }
+
+  /// Prepend the elements of a collection to the front of this deque by copying
+  /// them.
+  ///
+  /// If the deque does not have sufficient capacity to accommodate the new
+  /// elements, then this method reallocates the deque's storage to grow it,
+  /// using a geometric growth rate.
+  ///
+  /// This example prepends the elements of a `Range<Int>` instance
+  /// to a unique deque of integers.
+  ///
+  ///     var numbers = UniqueDeque<Int>()
+  ///     numbers.append(copying: [1, 2, 3, 4, 5])
+  ///     numbers.prepend(copying: 10...15)
+  ///     // `numbers` now contains [10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5]
+  ///
+  /// - Parameter items: The elements to prepend to the deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`items.count`) when amortized over many similar
+  ///     invocations on the same deque.
+  @inlinable
+  @_alwaysEmitIntoClient
+  public mutating func prepend(
+    copying items: some Collection<Element>
+  ) -> Range<Int> {
+    let done: Range<Int>? = items.withContiguousStorageIfAvailable { source in
+      unsafe self.prepend(copying: source)
+    }
+    if let done { return done }
+    let c = items.count
+    guard c > 0 else { return 0 ..< 0 }
+    _ensureFreeCapacity(c)
+    return unsafe _storage._handle.uncheckedPrepend(copying: items, exactCount: c)
+  }
+
+#if compiler(>=6.4)
+  /// Copies the elements of a borrowing sequence to the end of this deque.
+  ///
+  /// If the deque does not have sufficient capacity to hold all items in the
+  /// sequence, then this triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - items: The new elements to copy into the deque.
+  ///
+  /// - Complexity: O(*m*), where *m* is the length of `items`, as amortized
+  ///     over many similar invocations on the same deque.
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  public mutating func prepend<S: Iterable & Sequence<Element>>(
+    copying items: borrowing S
+  ) throws(S.Failure)
+  where S.Element == Element {
+    try self._prepend(copying: items)
+  }
+
+  /// Copies the elements of a borrowing sequence to the end of this deque.
+  ///
+  /// If the deque does not have sufficient capacity to hold all items in the
+  /// sequence, then this triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - items: The new elements to copy into the deque.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(*m*), where *m* is the length of `items` when amortized
+  ///     over many similar invocations on the same deque.
+  @available(SwiftStdlib 6.4, *)
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func prepend<S: Iterable & Collection<Element>>(
+    copying items: borrowing S
+  ) throws(S.Failure) -> Range<Int>
+  where S.Element == Element {
+    try self._prepend(copying: items, exactCount: items.count)
+  }
+#endif
+}

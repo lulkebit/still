@@ -1,0 +1,57 @@
+// swift-tools-version: 6.0
+
+import PackageDescription
+
+let package = Package(
+  name: "swift-concurrency-extras",
+  platforms: [
+    .iOS(.v13),
+    .macOS(.v10_15),
+    .tvOS(.v13),
+    .watchOS(.v6),
+  ],
+  products: [
+    .library(
+      name: "ConcurrencyExtras",
+      targets: ["ConcurrencyExtras"]
+    ),
+    .library(
+      name: "ConcurrencyExtrasTestSupport",
+      targets: ["ConcurrencyExtrasTestSupport"]
+    ),
+  ],
+  targets: [
+    .target(
+      name: "ConcurrencyExtras"
+    ),
+    .target(
+      name: "ConcurrencyExtrasTestSupport"
+    ),
+    .testTarget(
+      name: "ConcurrencyExtrasTests",
+      dependencies: [
+        "ConcurrencyExtras"
+      ]
+    ),
+  ],
+  swiftLanguageModes: [.v6]
+)
+
+#if !os(Windows)
+  // Add the documentation compiler plugin if possible
+  package.dependencies.append(
+    .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0")
+  )
+#endif
+
+for target in package.targets {
+  target.swiftSettings = target.swiftSettings ?? []
+  target.swiftSettings?.append(contentsOf: [
+    .enableUpcomingFeature("ExistentialAny"),
+    .enableUpcomingFeature("ImmutableWeakCaptures"),
+    .enableUpcomingFeature("InferIsolatedConformances"),
+    .enableUpcomingFeature("InternalImportsByDefault"),
+    .enableUpcomingFeature("MemberImportVisibility"),
+    .enableUpcomingFeature("NonisolatedNonsendingByDefault"),
+  ])
+}

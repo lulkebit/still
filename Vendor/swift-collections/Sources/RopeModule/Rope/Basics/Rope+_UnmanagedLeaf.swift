@@ -1,0 +1,52 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2023 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+extension Rope {
+  @frozen // Not really! This module isn't ABI stable.
+  @usableFromInline
+  @unsafe
+  internal struct _UnmanagedLeaf {
+    @usableFromInline internal typealias _Item = Rope._Item
+    @usableFromInline internal typealias _Leaf = _Storage<_Item>
+    @usableFromInline internal typealias _UnsafeHandle = Rope._UnsafeHandle
+
+    @usableFromInline var _ref: Unmanaged<_Leaf>
+
+    @inlinable
+    internal init(_ leaf: __shared _Leaf) {
+      unsafe _ref = .passUnretained(leaf)
+    }
+  }
+}
+
+extension Rope._UnmanagedLeaf: Equatable {
+  @inlinable
+  @safe
+  internal static func ==(left: Self, right: Self) -> Bool {
+    unsafe left._ref.toOpaque() == right._ref.toOpaque()
+  }
+}
+
+extension Rope._UnmanagedLeaf {
+  @inlinable
+  internal func read<R>(
+    body: (_UnsafeHandle<_Item>) -> R
+  ) -> R {
+    unsafe _ref._withUnsafeGuaranteedRef { leaf in
+      unsafe leaf.withUnsafeMutablePointers { h, p in
+        let handle = unsafe _UnsafeHandle(isMutable: false, header: h, start: p)
+        return unsafe body(handle)
+      }
+    }
+  }
+}

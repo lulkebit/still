@@ -9,9 +9,9 @@ let package = Package(
         .executable(name: "still", targets: ["Still"])
     ],
     dependencies: [
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", exact: "0.12.1"),
-        .package(url: "https://github.com/scinfu/SwiftSoup.git", exact: "2.14.3"),
-        .package(url: "https://github.com/gonzalezreal/textual.git", exact: "0.5.0")
+        .package(path: "Vendor/swift-sdk"),
+        .package(path: "Vendor/SwiftSoup"),
+        .package(path: "Vendor/textual")
     ],
     targets: [
         .executableTarget(

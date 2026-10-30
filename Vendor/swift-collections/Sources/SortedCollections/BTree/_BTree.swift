@@ -1,0 +1,603 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2021 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if UnstableSortedCollections
+
+/// A bidirectional collection representing a BTree which efficiently stores its
+/// elements in sorted order and maintains roughly `O(log count)`
+/// performance for most operations.
+///
+/// - Warning: Indexing operations on a BTree are unchecked. ``_BTree.Index``
+///   offers `ensureValid(for:)` methods to validate indices for use in higher-level
+///   collections.
+@usableFromInline
+package struct _BTree<Key: Comparable, Value> {
+  
+  /// Recommended node size of a given B-Tree
+  @inlinable
+  @inline(__always)
+  internal static var defaultInternalCapacity: Int {
+    #if DEBUG
+    return 4
+    #else
+    let capacityInBytes = 128
+    return Swift.max(16, capacityInBytes / MemoryLayout<Key>.stride)
+    #endif
+  }
+  
+  /// Recommended node size of a given B-Tree
+  @inlinable
+  @inline(__always)
+  internal static var defaultLeafCapacity: Int {
+    #if DEBUG
+    return 5
+    #else
+    let capacityInBytes = 2000
+    return Swift.max(16, capacityInBytes / MemoryLayout<Key>.stride)
+    #endif
+  }
+  
+  /// The element type of the collection.
+  @usableFromInline
+  package typealias Element = (key: Key, value: Value)
+
+  /// The type of each node in the tree
+  @usableFromInline
+  package typealias Node = _Node<Key, Value>
+
+  /// A size large enough to represent any slot within a node
+  @usableFromInline
+  package typealias Slot = UInt16
+
+  /// The underlying node behind this local BTree
+  @usableFromInline
+  package var root: Node
+
+  /// The capacity of each of the internal nodes
+  @usableFromInline
+  package var internalCapacity: Int
+
+  /// A metric to uniquely identify a given B-Tree's state. It is not
+  /// impossible for two B-Trees to have the same age by pure
+  /// coincidence.
+  @usableFromInline
+  package var version: Int
+
+  /// Creates a dummy B-Tree with no underlying node storage class.
+  ///
+  /// It is invalid and a serious error to ever attempt to read or write to such a B-Tree.
+  @inlinable
+  @inline(__always)
+  package static var dummy: _BTree {
+    _BTree(
+      _rootedAtNode: _Node.dummy,
+      internalCapacity: 0,
+      version: 0
+    )
+  }
+  
+  /// Creates an empty B-Tree with an automatically determined optimal capacity.
+  @inlinable
+  @inline(__always)
+  package init() {
+    let root = Node(withCapacity: _BTree.defaultLeafCapacity, isLeaf: true)
+    self.init(rootedAt: root, internalCapacity: _BTree.defaultInternalCapacity)
+  }
+  
+  /// Creates an empty B-Tree rooted at a specific node with a specified uniform capacity
+  /// - Parameter capacity: The key capacity of all nodes.
+  @inlinable
+  @inline(__always)
+  package init(capacity: Int) {
+    self.init(
+      leafCapacity: capacity,
+      internalCapacity: capacity
+    )
+  }
+  
+  /// Creates an empty B-Tree which creates node with specified capacities
+  /// - Parameters:
+  ///   - leafCapacity: The capacity of the leaf nodes. This is the initial buffer used to allocate.
+  ///   - internalCapacity: The capacity of the internal nodes. Generally preferred to be less than
+  ///       `leafCapacity`.
+  @inlinable
+  @inline(__always)
+  package init(leafCapacity: Int, internalCapacity: Int) {
+    self.init(
+      rootedAt: Node(withCapacity: leafCapacity, isLeaf: true),
+      internalCapacity: internalCapacity
+    )
+  }
+  
+  /// Creates a B-Tree rooted at a specific node
+  /// - Parameters:
+  ///   - root: The root node.
+  ///   - internalCapacity: The key capacity of new internal nodes.
+  @inlinable
+  @inline(__always)
+  package init(rootedAt root: Node, internalCapacity: Int) {
+    self.root = root
+    self.internalCapacity = internalCapacity
+    self.version = ObjectIdentifier(root.storage).hashValue
+  }
+  
+  @inlinable
+  @inline(__always)
+  package init(
+    _rootedAtNode root: Node,
+    internalCapacity: Int,
+    version: Int
+  ) {
+    self.root = root
+    self.internalCapacity = internalCapacity
+    self.version = version
+  }
+}
+
+// MARK: Mutating Operations
+extension _BTree {
+  /// Invalidates the issued indices of the dictionary. Ensure this is
+  /// called for operations which mutate the SortedDictionary.
+  @inlinable
+  @inline(__always)
+  package mutating func invalidateIndices() {
+    self.version &+= 1
+  }
+  
+  /// Inserts an element into the BTree, or updates it if it already exists within the tree. If there are
+  /// multiple instances of the key in the tree, this may update any one.
+  ///
+  /// This operation is marginally more efficient on trees without duplicates, and may have
+  /// inconsistent results on trees with duplicates.
+  ///
+  /// - Parameters:
+  ///   - value: The value to set corresponding to the key.
+  ///   - key: The key to search for.
+  ///   - updatingKey: If the key is found, whether it should be updated.
+  /// - Returns: If updated, the previous element.
+  /// - Complexity: O(`log n`)
+  @inlinable
+  @discardableResult
+  package mutating func updateAnyValue(
+    _ value: Value,
+    forKey key: Key,
+    updatingKey: Bool = false
+  ) -> Element? {
+    invalidateIndices()
+    defer { self.checkInvariants() }
+    
+    let result = unsafe self.root.update {
+      unsafe $0.updateAnyValue(value, forKey: key, updatingKey: updatingKey)
+    }
+    switch result {
+    case let .updated(previousValue):
+      return previousValue
+    case let .splintered(splinter):
+      self.root = splinter.toNode(
+        leftChild: self.root,
+        capacity: self.internalCapacity
+      )
+    default: break
+    }
+    
+    return nil
+  }
+  
+  /// Verifies if the tree is balanced post-removal
+  /// - Warning: This does not invalidate indices.
+  @inlinable
+  @inline(__always)
+  package mutating func _balanceRoot() {
+    if unsafe self.root.read({ unsafe $0.elementCount == 0 && !$0.isLeaf }) {
+      let newRoot: Node = unsafe self.root.update { handle in
+        let newRoot = unsafe handle.moveChild(atSlot: 0)
+        unsafe handle.drop()
+        return newRoot
+      }
+      
+      self.root = newRoot
+    }
+  }
+  
+  /// Removes the key-value pair corresponding to the first found instance of the key.
+  ///
+  /// This may not be the first instance of the key. This is marginally more efficient for trees
+  /// that do not have duplicates.
+  ///
+  /// If the key is not found, the tree is not modified, although the version of the tree may change.
+  ///
+  /// - Parameter key: The key to remove in the tree
+  /// - Returns: The key-value pair which was removed. `nil` if not removed.
+  @inlinable
+  @discardableResult
+  package mutating func removeAnyElement(forKey key: Key) -> Element? {
+    invalidateIndices()
+    defer { self.checkInvariants() }
+    
+    // TODO: It is possible that there is a single transient CoW copied made
+    // if the removal results in the CoW copied node being completely removed
+    // from the tree.
+    let removedElement = unsafe self.root.update {
+      unsafe $0.removeAnyElement(forKey: key)
+    }
+
+    // Check if the tree height needs to be reduced
+    self._balanceRoot()
+    self.checkInvariants()
+    
+    return removedElement
+  }
+}
+
+// MARK: Removal Operations
+extension _BTree {
+  /// Removes the element of a tree at a given offset.
+  ///
+  /// - Parameter offset: the offset which must be in-bounds.
+  /// - Returns: The moved element of the tree
+  @inlinable
+  @inline(__always)
+  @discardableResult
+  package mutating func remove(atOffset offset: Int) -> Element {
+    invalidateIndices()
+    defer { self.checkInvariants() }
+    
+    let removedElement = unsafe self.root.update {
+      unsafe $0.remove(at: offset)
+    }
+    self._balanceRoot()
+    
+    return removedElement
+  }
+}
+
+// MARK: Read Operations
+extension _BTree {
+  /// Determines if a key exists within a tree.
+  ///
+  /// - Parameter key: The key to search for.
+  /// - Returns: Whether or not the key was found.
+  @inlinable
+  package func contains(key: Key) -> Bool {
+    // the retain/release calls
+    // Retain
+    var node: Node? = self.root
+    
+    while let currentNode = node {
+      let found: Bool = unsafe currentNode.read { handle in
+        let slot = unsafe handle.startSlot(forKey: key)
+
+        if unsafe slot < handle.elementCount && handle[keyAt: slot] == key {
+          return true
+        } else {
+          if handle.isLeaf {
+            node = nil
+          } else {
+            // Release
+            // Retain
+            node = unsafe handle[childAt: slot]
+          }
+        }
+        
+        return false
+      }
+      
+      if found { return true }
+    }
+    
+    return false
+  }
+  
+  /// Returns the value corresponding to the first found instance of the key.
+  ///
+  /// This may not be the first instance of the key. This is marginally more efficient
+  /// for trees that do not have duplicates.
+  ///
+  /// - Parameter key: The key to search for
+  /// - Returns: `nil` if the key was not found. Otherwise, the previous value.
+  /// - Complexity: O(`log n`)
+  @inlinable
+  package func findAnyValue(forKey key: Key) -> Value? {
+    var node: Unmanaged<Node.Storage>? = unsafe .passUnretained(self.root.storage)
+
+    while let currentNode = unsafe node {
+      let value: Value? = unsafe currentNode._withUnsafeGuaranteedRef {
+        unsafe $0.read { handle in
+          let slot = unsafe handle.startSlot(forKey: key)
+
+          if unsafe slot < handle.elementCount && handle[keyAt: slot] == key {
+            return unsafe handle[valueAt: slot]
+          } else {
+            if handle.isLeaf {
+              unsafe node = nil
+            } else {
+              unsafe node = .passUnretained(handle[childAt: slot].storage)
+            }
+          }
+          
+          return nil
+        }
+      }
+      
+      if let value = value { return value }
+    }
+    
+    return nil
+  }
+  
+  /// Returns the path corresponding to the first found instance of the key. This may
+  /// not be the first instance of the key. This is marginally more efficient for trees
+  /// that do not have duplicates.
+  ///
+  /// - Parameter key: The key to search for within the tree.
+  /// - Returns: If found, returns a path to the element. Otherwise, `nil`.
+  @inlinable
+  package func findAnyIndex(forKey key: Key) -> Index? {
+    var childSlots = Index.Offsets(repeating: 0)
+    var node: Unmanaged? = unsafe .passUnretained(self.root.storage)
+    var offset: Int = 0
+    
+    while let currentNode = unsafe node {
+      let index: Index? = unsafe currentNode._withUnsafeGuaranteedRef { storage in
+        unsafe storage.read { handle in
+          let keySlot = unsafe handle.startSlot(forKey: key)
+          offset += keySlot
+          
+          if unsafe keySlot < handle.elementCount && handle[keyAt: keySlot] == key {
+            if !handle.isLeaf {
+              for i in 0...keySlot {
+                offset += unsafe handle[childAt: i].storage.header.subtreeCount
+              }
+            }
+            
+            return unsafe Index(
+              node: .passUnretained(storage),
+              slot: keySlot,
+              childSlots: childSlots,
+              offset: offset,
+              forTree: self
+            )
+          } else {
+            if handle.isLeaf {
+              unsafe node = nil
+            } else {
+              for i in 0..<keySlot {
+                offset += unsafe handle[childAt: i].storage.header.subtreeCount
+              }
+              
+              childSlots.append(UInt16(keySlot))
+              unsafe node = .passUnretained(handle[childAt: keySlot].storage)
+            }
+            
+            return nil
+          }
+        }
+      }
+      
+      if let index = index { return index }
+    }
+    
+    return nil
+  }
+  
+  /// Obtains the path to the element at a specified integer offset within the tree.
+  ///
+  /// - Parameter offset: The absolute offset that must be in-bounds or the last position.
+  /// - Returns: An unsafe path to the element, or `nil` if corresponds to the last position.
+  @inlinable
+  package func index(atOffset offset: Int) -> Index {
+    assert(offset <= self.count, "Index out of bounds")
+
+    // Return nil path if at the end of the tree
+    if offset == self.count {
+      return self.endIndex
+    }
+    
+    var childSlots = Index.Offsets(repeating: 0)
+    
+    var node: Unmanaged<Node.Storage> = unsafe .passUnretained(self.root.storage)
+    var startIndex = 0
+    
+    while true {
+      let index: Index? = unsafe node._withUnsafeGuaranteedRef { storage in
+        unsafe storage.read({ handle in
+          if handle.isLeaf {
+            return unsafe Index(
+              node: node,
+              slot: offset - startIndex,
+              childSlots: childSlots,
+              offset: offset,
+              forTree: self
+            )
+          }
+          
+          for childSlot in unsafe 0..<handle.childCount {
+            let childSubtreeCount =
+            unsafe handle[childAt: childSlot]._subtreeCount
+
+            let endIndex = startIndex + childSubtreeCount
+            
+            if offset < endIndex {
+              childSlots.append(UInt16(childSlot))
+              unsafe node = .passUnretained(handle[childAt: childSlot].storage)
+              return nil
+            } else if offset == endIndex {
+              // We've found the node we want
+              return unsafe Index(
+                node: node,
+                slot: childSlot,
+                childSlots: childSlots,
+                offset: offset,
+                forTree: self
+              )
+            } else {
+              startIndex = endIndex + 1
+              continue
+            }
+          }
+          
+          preconditionFailure("In-bounds index not found within tree")
+        })
+      }
+      
+      if let index = index { return index }
+    }
+  }
+}
+
+// MARK: Custom Indexing Operations
+extension _BTree {
+
+  /// Obtains the start index for a key (or where it would exist).
+  @inlinable
+  package func startIndex(forKey key: Key) -> Index {
+    var childSlots = Index.Offsets(repeating: 0)
+    var targetSlot: Int = 0
+    var offset = 0
+    
+    func search(in node: Node) -> Unmanaged<Node.Storage>? {
+      unsafe node.read({ handle in
+        let slot = unsafe handle.startSlot(forKey: key)
+
+        if handle.isLeaf {
+          if unsafe slot < handle.elementCount {
+            offset += slot
+            targetSlot = slot
+            return unsafe .passUnretained(node.storage)
+          }
+          return nil
+        }
+
+        // Internal node: advance offset to the start of child[slot].
+        // child[slot] starts after `slot` elements and `slot` preceding subtrees.
+        offset += slot
+        for i in 0..<slot {
+          offset += unsafe handle[childAt: i]._subtreeCount
+        }
+
+        if unsafe slot < handle.elementCount {
+          // elem[slot] >= key. Try child[slot] for an earlier occurrence first.
+          let elemOffset = unsafe offset + handle[childAt: slot]._subtreeCount
+          let savedDepth = childSlots.depth
+          childSlots.append(UInt16(slot))
+
+          if let foundEarlier = unsafe search(in: handle[childAt: slot]) {
+            return unsafe foundEarlier
+          }
+          childSlots.depth = savedDepth
+          targetSlot = slot
+          offset = elemOffset
+          return unsafe .passUnretained(node.storage)
+        } else {
+          // key > all elements here: descend into the rightmost child.
+          childSlots.append(UInt16(slot))
+          return unsafe search(in: handle[childAt: slot])
+        }
+      })
+    }
+    
+    if let targetChild = unsafe search(in: self.root) {
+      return unsafe Index(
+        node: targetChild,
+        slot: targetSlot,
+        childSlots: childSlots,
+        offset: offset,
+        forTree: self
+      )
+    } else {
+      return endIndex
+    }
+  }
+  
+  /// Obtains the last index at which a value less than or equal to the key appears.
+  @inlinable
+  package func lastIndex(forKey key: Key) -> Index {
+    var childSlots = Index.Offsets(repeating: 0)
+    var targetSlot: Int = 0
+    var offset = 0
+    
+    func search(in node: Node) -> Unmanaged<Node.Storage>? {
+      unsafe node.read { handle in
+        let slot = unsafe handle.endSlot(forKey: key) - 1
+
+        if handle.isLeaf {
+          if slot >= 0 {
+            offset += slot
+            targetSlot = slot
+            return unsafe .passUnretained(node.storage)
+          }
+          return nil
+        }
+
+        if slot >= 0 {
+          // elem[slot] <= key. Also check child[slot+1] for a greater
+          // element still <= key.
+          offset += slot
+          for i in 0..<slot {
+            offset += unsafe handle[childAt: i]._subtreeCount
+          }
+          offset += unsafe handle[childAt: slot]._subtreeCount
+          // offset = position of elem[slot]
+
+          let elemOffset = offset
+          let savedDepth = childSlots.depth
+          childSlots.append(UInt16(slot + 1))
+          offset += 1  // step past elem[slot] to the start of child[slot+1]
+
+          if let foundLater = unsafe search(in: handle[childAt: slot + 1]) {
+            return unsafe foundLater
+          }
+          childSlots.depth = savedDepth
+          targetSlot = slot
+          offset = elemOffset
+          return unsafe .passUnretained(node.storage)
+        } else {
+          // key < all elements here: descend into the leftmost child.
+          childSlots.append(UInt16(0))
+          return unsafe search(in: handle[childAt: 0])
+        }
+      }
+    }
+    
+    if let targetChild = unsafe search(in: self.root) {
+      return unsafe Index(
+        node: targetChild,
+        slot: targetSlot,
+        childSlots: childSlots,
+        offset: offset,
+        forTree: self
+      )
+    } else {
+      return endIndex
+    }
+  }
+  
+}
+
+// MARK: Immutable Operations
+extension _BTree {
+  @inlinable
+  @inline(__always)
+  package func mapValues<T>(
+    _ transform: (Value) throws -> T
+  ) rethrows -> _BTree<Key, T> {
+    let root = try _Node<Key, T>(
+      mappingFrom: self.root,
+      transform
+    )
+    
+    return _BTree<Key, T>(rootedAt: root, internalCapacity: internalCapacity)
+  }
+}
+
+#endif

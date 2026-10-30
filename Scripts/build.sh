@@ -2,28 +2,17 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-EDITOR_DIR="$ROOT_DIR/Editor"
-EDITOR_OUTPUT="$ROOT_DIR/Sources/Still/Resources/Editor/editor.js"
 APP_PATH="$ROOT_DIR/build/still.app"
 
-editor_needs_build=false
-if [[ ! -s "$EDITOR_OUTPUT" ]]; then
-  editor_needs_build=true
-else
-  while IFS= read -r source_file; do
-    if [[ "$source_file" -nt "$EDITOR_OUTPUT" ]]; then
-      editor_needs_build=true
-      break
-    fi
-  done < <(find "$EDITOR_DIR/src" -type f -print; printf '%s\n' "$EDITOR_DIR/package.json" "$EDITOR_DIR/package-lock.json" "$EDITOR_DIR/build.mjs")
-fi
+"$ROOT_DIR/Scripts/validate_editor_bundle.sh"
 
-if [[ "$editor_needs_build" == true ]]; then
-  if [[ ! -d "$EDITOR_DIR/node_modules" ]]; then
-    (cd "$EDITOR_DIR" && npm ci)
+for dependency in Vendor/swift-sdk Vendor/SwiftSoup Vendor/textual; do
+  if [[ ! -d "$ROOT_DIR/$dependency" ]]; then
+    echo "Missing locally vendored Swift dependency: $dependency" >&2
+    echo "Restore the checked-in Vendor directory before building." >&2
+    exit 1
   fi
-  (cd "$EDITOR_DIR" && npm run build)
-fi
+done
 
 cd "$ROOT_DIR"
 swift build -c release

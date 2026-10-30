@@ -1,0 +1,154 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2024 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+import XCTest
+#if COLLECTIONS_SINGLE_MODULE
+import Collections
+#else
+import InternalCollectionsUtilities
+import _CollectionsTestSupport
+#endif
+import ContainersPreview
+
+#if compiler(>=6.3) && UnstableContainersPreview
+final class MutableRefTests: CollectionTestCase {
+  struct NoncopyablePayload: ~Copyable {
+    var value: Int
+    init(_ value: Int) { self.value = value }
+  }
+
+  func test_basic() {
+    var x = 0
+    var y = _MutableRef(&x)
+
+    var v = y.value
+    XCTAssertEqual(v, 0)
+
+    y.value += 10
+
+    v = y.value
+    XCTAssertEqual(v, 10)
+    XCTAssertEqual(x, 10)
+  }
+
+  // MARK: init(_:) and value (read)
+
+  func test_init_and_value_read_int() {
+    var x = 42
+    let ref = _MutableRef(&x)
+    expectEqual(ref.value, 42)
+  }
+
+  func test_init_and_value_read_string() {
+    var s = "hello"
+    let ref = _MutableRef(&s)
+    expectEqual(ref.value, "hello")
+  }
+
+  func test_init_and_value_read_noncopyable() {
+    var payload = NoncopyablePayload(99)
+    let ref = _MutableRef(&payload)
+    expectEqual(ref.value.value, 99)
+  }
+
+  // MARK: value (write)
+
+  func test_value_write_int() {
+    var x = 0
+    var ref = _MutableRef(&x)
+    ref.value = 123
+    expectEqual(ref.value, 123)
+    expectEqual(x, 123)
+  }
+
+  func test_value_write_string() {
+    var s = "before"
+    var ref = _MutableRef(&s)
+    ref.value = "after"
+    expectEqual(ref.value, "after")
+    expectEqual(s, "after")
+  }
+
+  func test_value_write_noncopyable() {
+    var payload = NoncopyablePayload(1)
+    var ref = _MutableRef(&payload)
+    ref.value.value = 42
+    expectEqual(ref.value.value, 42)
+    expectEqual(payload.value, 42)
+  }
+
+  // MARK: value (in-place mutation)
+
+  func test_value_inplace_mutation() {
+    var x = 10
+    var ref = _MutableRef(&x)
+    ref.value += 32
+    expectEqual(ref.value, 42)
+    expectEqual(x, 42)
+  }
+
+  func test_value_inplace_mutation_array() {
+    var array = [1, 2, 3]
+    var ref = _MutableRef(&array)
+    ref.value.append(4)
+    expectEqual(ref.value, [1, 2, 3, 4])
+    expectEqual(array, [1, 2, 3, 4])
+  }
+
+  // MARK: init(unsafeAddress:mutating:)
+
+  func test_init_unsafeAddress_mutating() {
+    var x = 789
+    let pointer = withUnsafeMutablePointer(to: &x) { unsafe $0 }
+    var ref = unsafe _MutableRef(unsafeAddress: pointer, mutating: &x)
+    expectEqual(ref.value, 789)
+    ref.value = 111
+    expectEqual(ref.value, 111)
+  }
+
+  // MARK: init(unsafeImmortalAddress:)
+
+  func test_init_unsafeImmortalAddress() {
+    var x = 555
+    let pointer = withUnsafeMutablePointer(to: &x) { unsafe $0 }
+    var ref = unsafe _MutableRef(unsafeImmortalAddress: pointer)
+    expectEqual(ref.value, 555)
+    ref.value = 666
+    expectEqual(ref.value, 666)
+  }
+
+  // MARK: Reference type identity
+
+  func test_reference_type_identity() {
+    let tracker = LifetimeTracker()
+    var obj: LifetimeTracked<Int>? = tracker.instance(for: 7)
+    let ref = _MutableRef(&obj)
+    expectNotNil(ref.value)
+    expectEqual(ref.value!.payload, 7)
+  }
+
+  // MARK: Multiple writes through _MutableRef
+
+  func test_multiple_writes() {
+    var x = 0
+    var ref = _MutableRef(&x)
+    ref.value = 1
+    expectEqual(ref.value, 1)
+    ref.value = 2
+    expectEqual(ref.value, 2)
+    ref.value = 3
+    expectEqual(ref.value, 3)
+    expectEqual(x, 3)
+  }
+}
+#endif

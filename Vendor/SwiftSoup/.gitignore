@@ -1,0 +1,18 @@
+# OS X
+.DS_Store
+
+# Swift Package Manager
+.build
+/Derived/
+Package.resolved
+!SwiftSoup.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+# Xcode user settings
+xcuserdata/
+
+# Generated benchmarks
+Resources/benchmarks/atlas.html
+Resources/benchmarks/colossal.html
+Resources/benchmarks/mega.html
+Resources/benchmarks/omega.html
+Resources/benchmarks/titan.html

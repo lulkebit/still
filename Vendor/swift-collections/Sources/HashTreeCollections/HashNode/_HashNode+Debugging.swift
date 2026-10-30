@@ -1,0 +1,125 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2022 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if !COLLECTIONS_SINGLE_MODULE
+import InternalCollectionsUtilities
+#endif
+
+extension _HashNode {
+  @usableFromInline
+  internal func dump(
+    iterationOrder: Bool = false,
+    limit: Int = Int.max,
+    firstPrefix: String = "",
+    restPrefix: String = "",
+    depth: Int = 0
+  ) {
+    unsafe read {
+      unsafe $0.dump(
+        iterationOrder: iterationOrder,
+        limit: limit,
+        extra: "count: \(count), ",
+        firstPrefix: firstPrefix,
+        restPrefix: restPrefix,
+        depth: depth)
+    }
+  }
+}
+
+extension _HashNode.Storage {
+  @usableFromInline
+  final internal func dump(iterationOrder: Bool = false) {
+    unsafe UnsafeHandle.read(self) {
+      unsafe $0.dump(iterationOrder: iterationOrder)
+    }
+  }
+}
+
+extension _HashNode {
+  internal static func _itemString(for item: Element) -> String {
+    let hash = _Hash(item.key).description
+    return "hash: \(hash), key: \(item.key), value: \(item.value)"
+  }
+}
+extension _HashNode.UnsafeHandle {
+  internal func _itemString(at slot: _HashSlot) -> String {
+    let item = unsafe self[item: slot]
+    return _HashNode._itemString(for: item)
+  }
+
+  @usableFromInline
+  internal func dump(
+    iterationOrder: Bool = false,
+    limit: Int = .max,
+    extra: String = "",
+    firstPrefix: String = "",
+    restPrefix: String = "",
+    depth: Int = 0
+  ) {
+    var firstPrefix = firstPrefix
+    var restPrefix = restPrefix
+    if iterationOrder && depth == 0 {
+      firstPrefix += "@"
+      restPrefix += "@"
+    }
+    if iterationOrder {
+      firstPrefix += "  "
+    }
+    print("""
+      \(firstPrefix)\(unsafe isCollisionNode ? "CollisionNode" : "Node")(\
+      at: \(_addressString(for: unsafe _header)), \
+      \(unsafe isCollisionNode ? "hash: \(unsafe collisionHash), " : "")\
+      \(extra)\
+      byteCapacity: \(unsafe byteCapacity), \
+      freeBytes: \(unsafe bytesFree))
+      """)
+    guard limit > 0 else { return }
+    if iterationOrder {
+      for slot in stride(from: .zero, to: unsafe itemsEndSlot, by: 1) {
+        print("  \(restPrefix)[\(slot)]  \(unsafe _itemString(at: slot))")
+      }
+      for slot in stride(from: .zero, to: unsafe childrenEndSlot, by: 1) {
+        unsafe self[child: slot].dump(
+          iterationOrder: true,
+          limit: limit - 1,
+          firstPrefix: "  \(restPrefix).\(slot)",
+          restPrefix: "  \(restPrefix).\(slot)",
+          depth: depth + 1)
+      }
+    }
+    else if unsafe isCollisionNode {
+      for slot in stride(from: .zero, to: unsafe itemsEndSlot, by: 1) {
+        print("\(restPrefix)[\(slot)] \(unsafe _itemString(at: slot))")
+      }
+    } else {
+      var itemSlot: _HashSlot = .zero
+      var childSlot: _HashSlot = .zero
+      for b in 0 ..< UInt(_Bitmap.capacity) {
+        let bucket = _Bucket(b)
+        let bucketStr = "#\(String(b, radix: _Bitmap.capacity, uppercase: true))"
+        if unsafe itemMap.contains(bucket) {
+          print("\(restPrefix)  \(bucketStr) \(unsafe _itemString(at: itemSlot))")
+          itemSlot = itemSlot.next()
+        } else if unsafe childMap.contains(bucket) {
+          unsafe self[child: childSlot].dump(
+            iterationOrder: false,
+            limit: limit - 1,
+            firstPrefix: "\(restPrefix)  \(bucketStr) ",
+            restPrefix: "\(restPrefix)     ",
+            depth: depth + 1)
+          childSlot = childSlot.next()
+        }
+      }
+    }
+  }
+}

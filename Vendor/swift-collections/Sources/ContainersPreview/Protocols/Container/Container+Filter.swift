@@ -1,0 +1,120 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if COLLECTIONS_FOUNDATION_TOOLCHAIN_MODULE
+import _FoundationCollections
+#elseif COLLECTIONS_SINGLE_MODULE
+import Collections
+#else
+import InternalCollectionsUtilities
+#endif
+
+#if compiler(>=6.4) && UnstableContainersPreview
+
+@available(SwiftStdlib 6.4, *)
+extension Container where Self: ~Copyable /*& ~Escapable*/, Element: ~Copyable {
+  @_alwaysEmitIntoClient
+  @_lifetime(borrow self)
+  public func _filter(
+    _ isIncluded: @escaping (borrowing Element) -> Bool
+  ) -> ContainerFilter<Self> {
+    ContainerFilter<Self>(_base: self, isIncluded: isIncluded)
+  }
+}
+
+@available(SwiftStdlib 6.4, *)
+extension ContainerIterator where Base.Element: ~Copyable {
+  @_alwaysEmitIntoClient
+  @_lifetime(copy self)
+  public func filter(
+    _ isIncluded: @escaping (borrowing Element) -> Bool
+  ) -> ContainerFilter<Base> {
+    ContainerFilter<Base>(_base: _base, index: _position, isIncluded: isIncluded)
+  }
+}
+
+@available(SwiftStdlib 6.4, *)
+public struct ContainerFilter<
+  Base: Container & ~Copyable/* FIXME & ~Escapable */
+>: ~Copyable, ~Escapable
+where Base.Element: ~Copyable
+{
+  public typealias Element = Base.Element
+
+  @_alwaysEmitIntoClient
+  public let _isIncluded: (borrowing Element) -> Bool
+
+  @_alwaysEmitIntoClient
+  public let _base: Ref<Base> // FIXME: This does not allow escapable Bases
+
+  @_alwaysEmitIntoClient
+  public var _position: Base.Index
+
+  @_alwaysEmitIntoClient
+  public var _remainder: Span<Element>
+
+  @_alwaysEmitIntoClient
+  @_lifetime(copy _base)
+  internal init(
+    _base: Ref<Base>,
+    index: Base.Index,
+    isIncluded: @escaping (borrowing Element) -> Bool
+  ) {
+    self._isIncluded = isIncluded
+    self._base = _base
+    self._position = index
+    self._remainder = .init()
+  }
+
+  @_alwaysEmitIntoClient
+  @_lifetime(borrow _base)
+  internal init(
+    _base: borrowing Base,
+    isIncluded: @escaping (borrowing Element) -> Bool
+  ) {
+    self._isIncluded = isIncluded
+    self._base = Ref(_base)
+    self._position = _base.startIndex
+    self._remainder = .init()
+  }
+}
+
+// FIXME: Sendable
+
+@available(SwiftStdlib 6.4, *)
+extension ContainerFilter: BorrowingIteratorProtocol where Element: ~Copyable {
+  @_lifetime(&self)
+  public mutating func nextSpan(maxCount: Int) -> Span<Element> {
+    precondition(maxCount > 0)
+    while true {
+      // Drop filtered out items from prefix of _remainder
+      var i = 0
+      while i < _remainder.count, unsafe !_isIncluded(_remainder[unchecked: i]) {
+        i &+= 1
+      }
+      _remainder = _remainder.extracting(droppingFirst: i)
+      if !_remainder.isEmpty {
+        let c = Swift.min(_remainder.count, maxCount)
+        i = 1
+        while i < c, unsafe _isIncluded(_remainder[unchecked: i]) {
+          i &+= 1
+        }
+        return _remainder._trim(first: i)
+      }
+      _remainder = _base.value.nextSpan(after: &_position)
+      if _remainder.isEmpty { return .init() }
+    }
+  }
+}
+
+#endif

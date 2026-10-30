@@ -1,0 +1,403 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Collections open source project
+//
+// Copyright (c) 2024 - 2026 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+//
+// SPDX-License-Identifier: Apache-2.0 WITH Swift-exception
+//
+//===----------------------------------------------------------------------===//
+
+#if !COLLECTIONS_SINGLE_MODULE
+import InternalCollectionsUtilities
+import SpanPreview
+#endif
+
+@available(SwiftStdlib 5.0, *)
+extension RigidArray where Element: ~Copyable {
+  /// Inserts a new element into the array at the specified position.
+  ///
+  /// If the array does not have sufficient capacity to hold any more elements,
+  /// then this triggers a runtime error.
+  ///
+  /// The new element is inserted before the element currently at the specified
+  /// index. If you pass the array's `endIndex` as the `index` parameter, then
+  /// the new element is appended to the container.
+  ///
+  /// All existing elements at or following the specified position are moved to
+  /// make room for the new item.
+  ///
+  /// - Parameter item: The new element to insert into the array.
+  /// - Parameter index: The position at which to insert the new element.
+  ///   `index` must be a valid index in the array.
+  /// - Returns: A valid index to the newly inserted item.
+  /// - Complexity: O(`self.count`)
+  @inlinable
+  @discardableResult
+  public mutating func insert(_ item: consuming Element, at index: Int) -> Int {
+    _checkValidIndex(index)
+    precondition(!isFull, "RigidArray capacity overflow")
+    if index < count {
+      let source = unsafe _storage.extracting(index ..< count)
+      let target = unsafe _storage.extracting(index + 1 ..< count + 1)
+      let last = unsafe target.moveInitialize(fromContentsOf: source)
+      assert(last == target.endIndex)
+    }
+    unsafe _storage.initializeElement(at: index, to: item)
+    unsafe _count += 1
+    return index
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension RigidArray where Element: ~Copyable {
+  /// Inserts a given number of new items into this array at the specified
+  /// position, using a callback to directly initialize array storage by
+  /// populating an output span.
+  ///
+  /// Existing elements in the array's storage are moved towards the back as
+  /// needed to make room for the new items.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the specified
+  /// number of new elements, then this method triggers a runtime error.
+  ///
+  ///     var buffer = RigidArray<Int>(capacity: 20)
+  ///     buffer.append([-999, 999])
+  ///     var i = 0
+  ///     buffer.insert(capacity: 3, at: 1) { target in
+  ///       while !target.isFull {
+  ///         target.append(i)
+  ///         i += 1
+  ///       }
+  ///     }
+  ///     // `buffer` now contains [-999, 0, 1, 2, 999]
+  ///
+  /// If the callback fails to fully populate its output span or if
+  /// it throws an error, then the array keeps all items that were
+  /// successfully initialized before the callback terminated the insertion.
+  ///
+  /// Partial insertions create a gap in array storage that needs to be
+  /// closed by moving already inserted items to their correct positions given
+  /// the adjusted count. This adds some overhead compared to adding exactly as
+  /// many items as promised.
+  ///
+  /// - Parameters:
+  ///    - newItemCount: The maximum number of items to insert into the array.
+  ///    - index: The position at which to insert the new items.
+  ///       `index` must be a valid index in the array.
+  ///    - initializer: A callback that gets called at most once to directly
+  ///       populate newly reserved storage within the array. The function
+  ///      is always called with an empty output span.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`self.count` + `newItemCount`) in addition to the complexity
+  ///    of the callback invocations.
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  @discardableResult
+  public mutating func insert<E: Error>(
+    addingCount newItemCount: Int,
+    at index: Int,
+    initializingWith initializer: (inout OutputSpan<Element>) throws(E) -> Void
+  ) throws(E) -> Range<Int> {
+    _checkValidIndex(index)
+    precondition(newItemCount >= 0, "Cannot add a negative number of items")
+    precondition(newItemCount <= freeCapacity, "RigidArray capacity overflow")
+    let target = unsafe _openGap(at: index, count: newItemCount)
+    unsafe _count &+= newItemCount
+    var span = unsafe OutputSpan(buffer: target, initializedCount: 0)
+    defer {
+      let c = unsafe span.finalize(for: target)
+      if c < newItemCount {
+        unsafe _closeGap(at: index &+ c, count: newItemCount &- c)
+        unsafe _count &-= newItemCount &- c
+      }
+      span = OutputSpan()
+    }
+    try initializer(&span)
+    return index ..< (index + span.count)
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension RigidArray where Element: ~Copyable {
+  /// Moves the elements of a fully initialized buffer into this array,
+  /// starting at the specified position, and leaving the buffer
+  /// uninitialized.
+  ///
+  /// All existing elements at or following the specified position are moved to
+  /// make room for the new items.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the new
+  /// elements, then this method triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - items: A fully initialized buffer whose contents to move into
+  ///        the array.
+  ///    - index: The position at which to insert the new items.
+  ///       `index` must be a valid index in the array.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`self.count` + `items.count`)
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func insert(
+    moving items: UnsafeMutableBufferPointer<Element>,
+    at index: Int
+  ) -> Range<Int> {
+    insert(addingCount: items.count, at: index) { target in
+      unsafe target._append(moving: items)
+    }
+  }
+
+#if UnstableContainersPreview
+  /// Moves the elements of an input span into this array,
+  /// starting at the specified position, and leaving the span empty.
+  ///
+  /// All existing elements at or following the specified position are moved to
+  /// make room for the new items.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the new
+  /// elements, then this method triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - items: An input span whose contents to move into
+  ///        the array.
+  ///    - index: The position at which to insert the new items.
+  ///       `index` must be a valid index in the array.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`self.count` + `items.count`)
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func insert(
+    moving items: inout InputSpan<Element>,
+    at index: Int
+  ) -> Range<Int> {
+    // FIXME: Remove when InputSpan starts conforming to RangeReplaceableContainer
+    unsafe items.withUnsafeMutableBufferPointer { buffer, count in
+      let source = unsafe buffer._extracting(last: count)
+      count = 0
+      return unsafe self.insert(moving: source, at: index)
+    }
+  }
+#endif
+
+  /// Moves the elements of an output span into this array,
+  /// starting at the specified position, and leaving the span empty.
+  ///
+  /// All existing elements at or following the specified position are moved to
+  /// make room for the new items.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the new
+  /// elements, then this method triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - items: An output span whose contents to move into
+  ///        the array.
+  ///    - index: The position at which to insert the new items.
+  ///       `index` must be a valid index in the array.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`self.count` + `items.count`)
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func insert(
+    moving items: inout OutputSpan<Element>,
+    at index: Int
+  ) -> Range<Int> {
+    // FIXME: Remove when OutputSpan starts conforming to RangeReplaceableContainer
+    unsafe items.withUnsafeMutableBufferPointer { buffer, count in
+      let source = unsafe buffer._extracting(first: count)
+      count = 0
+      return unsafe self.insert(moving: source, at: index)
+    }
+  }
+
+  /// Inserts the elements of a given array into the given position in this
+  /// array by moving them between the containers. On return, the input array
+  /// becomes empty, but it is not destroyed, and it preserves its original
+  /// storage capacity.
+  ///
+  /// All existing elements at or following the specified position are moved to
+  /// make room for the new items.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the new
+  /// elements, then this method triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - items: An array whose contents to move into `self`.
+  ///    - index: The position at which to insert the new items.
+  ///       `index` must be a valid index in the array.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`count` + `items.count`)
+  @_alwaysEmitIntoClient
+  @discardableResult
+  public mutating func insert(
+    moving items: inout RigidArray<Element>,
+    at index: Int
+  ) -> Range<Int> {
+    // FIXME: Remove this in favor of a generic algorithm over consumable containers
+    guard !items.isEmpty else {
+      _checkValidIndex(index)
+      return index ..< index
+    }
+    return items.edit { source in
+      self.insert(moving: &source, at: index)
+    }
+  }
+}
+
+@available(SwiftStdlib 5.0, *)
+extension RigidArray {
+  /// Copies the elements of a fully initialized buffer pointer into this
+  /// array at the specified position.
+  ///
+  /// The new elements are inserted before the element currently at the
+  /// specified index. If you pass the array's `endIndex` as the `index`
+  /// parameter, then the new elements are appended to the end of the array.
+  ///
+  /// All existing elements at or following the specified position are moved to
+  /// make room for the new items.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the new
+  /// elements, then this method triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - newElements: The new elements to insert into the array. The buffer
+  ///       must be fully initialized.
+  ///    - index: The position at which to insert the new elements. It must be
+  ///       a valid index of the array.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`count` + `newElements.count`)
+  @inlinable
+  @discardableResult
+  public mutating func insert(
+    copying newElements: UnsafeBufferPointer<Element>, at index: Int
+  ) -> Range<Int> {
+    guard newElements.count > 0 else {
+      _checkValidIndex(index)
+      return index ..< index
+    }
+    return self.insert(addingCount: newElements.count, at: index) { target in
+      unsafe target._append(copying: newElements)
+    }
+  }
+
+  /// Copies the elements of a fully initialized buffer pointer into this
+  /// array at the specified position.
+  ///
+  /// The new elements are inserted before the element currently at the
+  /// specified index. If you pass the array's `endIndex` as the `index`
+  /// parameter, then the new elements are appended to the end of the array.
+  ///
+  /// All existing elements at or following the specified position are moved to
+  /// make room for the new item.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the new
+  /// elements, then this method triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - newElements: The new elements to insert into the array. The buffer
+  ///       must be fully initialized.
+  ///    - index: The position at which to insert the new elements. It must be
+  ///       a valid index of the array.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`count` + `newElements.count`)
+  @inlinable
+  @inline(__always)
+  @discardableResult
+  public mutating func insert(
+    copying newElements: UnsafeMutableBufferPointer<Element>,
+    at index: Int
+  ) -> Range<Int> {
+    unsafe self.insert(copying: UnsafeBufferPointer(newElements), at: index)
+  }
+
+  /// Copies the elements of a span into this array at the specified position.
+  ///
+  /// The new elements are inserted before the element currently at the
+  /// specified index. If you pass the array's `endIndex` as the `index`
+  /// parameter, then the new elements are appended to the end of the array.
+  ///
+  /// All existing elements at or following the specified position are moved to
+  /// make room for the new item.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the new
+  /// elements, then this method triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - newElements: The new elements to insert into the array.
+  ///    - index: The position at which to insert the new elements. It must be
+  ///        a valid index of the array.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`count` + `newElements.count`)
+  @inlinable
+  @inline(__always)
+  @discardableResult
+  public mutating func insert(
+    copying newElements: Span<Element>, at index: Int
+  ) -> Range<Int> {
+    guard newElements.count > 0 else {
+      _checkValidIndex(index)
+      return index ..< index
+    }
+    return self.insert(addingCount: newElements.count, at: index) { target in
+      target._append(copying: newElements)
+    }
+  }
+
+  @_alwaysEmitIntoClient
+  @discardableResult
+  package mutating func _insertCollection(
+    addingCount newCount: Int,
+    copying items: some Collection<Element>,
+    at index: Index
+  ) -> Range<Int> {
+    // FIXME: Remove this -- RangeReplaceContainer already has this algorithm,
+    // albeit with stricter availability.
+    let res: Range<Int>? = items.withContiguousStorageIfAvailable { buffer in
+      precondition(buffer.count == newCount, "Broken Collection: mismatching count")
+      return self.insert(addingCount: buffer.count, at: index) { target in
+        unsafe target._append(copying: buffer)
+      }
+    }
+    if let res { return res }
+    var it = items.makeIterator()
+    self.insert(addingCount: newCount, at: index) { target in
+      while !target.isFull {
+        guard let item = it.next() else { preconditionFailure() }
+        target.append(item)
+      }
+    }
+    precondition(it.next() == nil, "Broken Collection")
+    return index ..< (index + newCount)
+  }
+
+  /// Copies the elements of a collection into this array at the specified
+  /// position.
+  ///
+  /// The new elements are inserted before the element currently at the
+  /// specified index. If you pass the array's `endIndex` as the `index`
+  /// parameter, then the new elements are appended to the end of the array.
+  ///
+  /// All existing elements at or following the specified position are moved
+  /// to make room for the new item.
+  ///
+  /// If the capacity of the array isn't sufficient to accommodate the new
+  /// elements, then this method triggers a runtime error.
+  ///
+  /// - Parameters:
+  ///    - items: The new elements to insert into the array.
+  ///    - index: The position at which to insert the new elements. It must be
+  ///        a valid index of the array.
+  /// - Returns: A valid index range addressing the newly inserted items.
+  /// - Complexity: O(`count` + `newElements.count`)
+  @_alwaysEmitIntoClient
+  @inline(__always)
+  @discardableResult
+  public mutating func insert(
+    copying items: some Collection<Element>, at index: Int
+  ) -> Range<Int> {
+    _insertCollection(addingCount: items.count, copying: items, at: index)
+  }
+}
